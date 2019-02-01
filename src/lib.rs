@@ -13,22 +13,21 @@ use stun_codec::{MessageDecoder, MessageEncoder};
 use bytecodec::{DecodeExt, EncodeExt};
 use std::net::{SocketAddr};
 use stun_codec::rfc5389::attributes::{
-     Software,
-     XorMappedAddress,
-     // XorMappedAddress2, 
-     MappedAddress,
+    Software,
 };
 use stun_codec::rfc5389::{methods::BINDING, Attribute};
 use stun_codec::{Message, MessageClass, TransactionId};
 use std::time::Duration;
 
-use futures::{Stream, Sink, Future};
+use futures::{Stream, Sink, Future, Poll, Async};
 
 /// Primitive error handling used in this library.
 /// File an issue if you don't like it.
 pub type Error = Box<dyn std::error::Error>;
 
 use tokio_udp::UdpSocket;
+
+use tokio_timer::Interval;
 
 
 
@@ -68,20 +67,39 @@ impl TurnClientBuilder {
 
     // too lazy to bring in builder pattern methods now
 
-    pub fn allocate() -> impl Future<Item=TurnClient, Error=Error> {
-        futures::future::result(unimplemented!())
+    pub fn allocate(self, udp: UdpSocket) -> impl Future<Item=TurnClient, Error=Error> {
+        let retry_timer = Interval::new_interval(self.retry_interval);
+        futures::future::ok(TurnClient{
+            opts: self,
+            udp,
+            retry_timer
+        })
     }
+}
+
+pub enum MessageFromTurnServer {
+
 }
 
 pub struct TurnClient {
     opts: TurnClientBuilder,
     udp: UdpSocket,
+    retry_timer: Interval,
 }
 
 impl TurnClient {
     /// Consume this TURN client, returning back control of used UDP socket
     pub fn into_udp_socket(self) -> UdpSocket {
         self.udp
+    }
+}
+
+impl Stream for TurnClient {
+    type Error = Error;
+    type Item = MessageFromTurnServer;
+
+    fn poll(&mut self) -> Poll<Option<MessageFromTurnServer>, Error> {
+        unimplemented!()
     }
 }
 
