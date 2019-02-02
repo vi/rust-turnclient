@@ -11,6 +11,8 @@ extern crate futures;
 extern crate tokio_udp;
 extern crate tokio_timer;
 
+extern crate fnv;
+
 use stun_codec::{MessageDecoder, MessageEncoder};
 
 use bytecodec::{DecodeExt, EncodeExt};
@@ -38,6 +40,8 @@ use std::time::{Instant,Duration};
 use self::attrs::Attribute;
 
 use futures::{Stream, Sink, Future, Poll, Async};
+
+use fnv::FnvHashMap as HashMap;
 
 mod attrs { 
     extern crate stun_codec;
@@ -83,7 +87,7 @@ pub type Error = Box<dyn std::error::Error>;
 
 use tokio_udp::UdpSocket;
 
-use tokio_timer::Interval;
+use tokio_timer::{Interval,Delay};
 
 
 
@@ -124,13 +128,12 @@ impl TurnClientBuilder {
     // too lazy to bring in builder pattern methods now
 
     pub fn build_and_send_request(self, udp: UdpSocket) -> impl Future<Item=TurnClient, Error=Error> {
-        let retry_timer = Interval::new_interval(self.retry_interval);
         let tc = TurnClient{
             opts: self,
             udp,
-            retry_timer,
-            trans_id: gen_transaction_id(),
-            data_to_be_sent_while_polling: None,
+
+            inflight: HashMap::with_capacity_and_hasher(2, Default::default()),
+
             allocation_lifetime: None,
             realm: None,
             nonce: None,
@@ -159,12 +162,20 @@ pub enum MessageFromTurnServer {
     ForeignPacket(SocketAddr, Vec<u8>),
 }
 
+enum InflightRequestStatus {
+    SendNow,
+    RetryLater(Delay),
+}
+
+/// Unaccepted request being retried
+struct InflightRequest(InflightRequestStatus, Vec<u8>);
+
 pub struct TurnClient {
     opts: TurnClientBuilder,
     udp: UdpSocket,
-    retry_timer: Interval,
-    trans_id: TransactionId,
-    data_to_be_sent_while_polling: Option<Vec<u8>>,
+
+    inflight: HashMap<TransactionId, InflightRequest>,
+
     /// None means not yet allocated
     allocation_lifetime: Option<Instant>,
     realm: Option<Realm>,
@@ -187,8 +198,8 @@ fn gen_transaction_id() -> TransactionId {
 impl TurnClient {
     /// Send allocate or refresh request
     fn send_allocate_request(&mut self) -> Result<(), Error> {
-        assert!(self.data_to_be_sent_while_polling == None);
-        let mut message : Message<Attribute> = Message::new(MessageClass::Request, ALLOCATE, self.trans_id);
+        let transid = gen_transaction_id();
+        let mut message : Message<Attribute> = Message::new(MessageClass::Request, ALLOCATE, transid);
               
         if let Some(s) = self.opts.software {
             message.add_attribute(Attribute::Software(Software::new(
@@ -224,12 +235,9 @@ impl TurnClient {
         let mut encoder = MessageEncoder::new();
         let bytes = encoder.encode_into_bytes(message.clone())?;
 
-        match self.udp.poll_send_to(&bytes[..], &self.opts.turn_server) {
-            Ok(Async::NotReady) => self.data_to_be_sent_while_polling = Some(bytes),
-            Err(e) => Err(e)?,
-            Ok(Async::Ready(len)) => assert_eq!(len, bytes.len()),
-        }
-
+        let rq = InflightRequest(InflightRequestStatus::SendNow, bytes);
+        self.inflight.insert(transid, rq);
+    
         Ok(())
     }
 
@@ -237,16 +245,20 @@ impl TurnClient {
     fn handle_incoming_packet(&mut self, buf:&[u8]) -> Result<MessageFromTurnServer, Error> {
         use self::MessageFromTurnServer::*;
 
-        if self.allocation_lifetime.is_none() {
-            let mut decoder = MessageDecoder::<Attribute>::new();
+        let mut decoder = MessageDecoder::<Attribute>::new();
 
-            let decoded = decoder
-                .decode_from_bytes(buf)?
-                .map_err(|_| format!("Broken TURN reply"))?;
-            if decoded.transaction_id() != self.trans_id {
-                return Ok(ForeignPacket(self.opts.turn_server, buf.to_vec()));
-            }
-            
+        let decoded = decoder
+            .decode_from_bytes(buf)?
+            .map_err(|_| format!("Broken TURN reply"))?;
+
+        // TODO: move it somewhere when starting handling Indication
+        if self.inflight.get(&decoded.transaction_id()).is_none() {
+            return Ok(ForeignPacket(self.opts.turn_server, buf.to_vec()));
+        } else {
+            self.inflight.remove(&decoded.transaction_id());
+        }
+
+        if self.allocation_lifetime.is_none() {
             use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
             match decoded.class() {
                 SuccessResponse => {
@@ -284,7 +296,6 @@ impl TurnClient {
                             self.realm = Some(re.clone());
                             self.nonce = Some(no.clone());
 
-                            self.trans_id = gen_transaction_id();
                             self.send_allocate_request();
                         },
                         300 => {
@@ -323,7 +334,7 @@ impl Stream for TurnClient {
             let mut buf = [0; 512];
             match self.udp.poll_recv_from(&mut buf[..]) {
                 Err(e) => Err(e)?,
-                Ok(Async::NotReady) => break,
+                Ok(Async::NotReady) => (),
                 Ok(Async::Ready((len, addr))) => {
                     let buf = &buf[0..len];
                     if addr != self.opts.turn_server {
@@ -333,38 +344,34 @@ impl Stream for TurnClient {
                     return Ok(Async::Ready(Some(ret)));
                 },
             }
-        }
 
-        // Then comes sending debt
-        if self.data_to_be_sent_while_polling.is_some() {
-            let d = self.data_to_be_sent_while_polling.as_ref().unwrap();
-            match self.udp.poll_send_to(&d[..], &self.opts.turn_server) {
-                Ok(Async::NotReady) => {
-                    // No continuing unless UDP socket gets unblocked
-                    return Ok(Async::NotReady);
-                },
-                Err(e) => Err(e)?,
-                Ok(Async::Ready(len)) => {
-                    assert_eq!(len, d.len());
-                    self.data_to_be_sent_while_polling = None;
-                },
+            for (_, rq) in &mut self.inflight {
+                match &mut rq.0 {
+                    InflightRequestStatus::SendNow => {
+                        match self.udp.poll_send_to(&rq.1[..], &self.opts.turn_server) {
+                            Err(e)=>Err(e)?,
+                            Ok(Async::NotReady)=>(),
+                            Ok(Async::Ready(len)) => {
+                                assert_eq!(len, rq.1.len());
+                                rq.0 = InflightRequestStatus::RetryLater(Delay::new(Instant::now() + self.opts.retry_interval));
+                                continue;
+                            },
+                        }
+                    },
+                    InflightRequestStatus::RetryLater(ref mut d) => {
+                        match d.poll() {
+                            Err(e)=>Err(e)?,
+                            Ok(Async::NotReady)=>(),
+                            Ok(Async::Ready(())) => {
+                                rq.0 = InflightRequestStatus::SendNow;
+                                continue;
+                            }
+                        }
+                    },
+                }
             }
-        }
-        
-        // Then handling association retry interval
-        loop {
-            match self.retry_timer.poll() {
-                Err(e) => Err(e)?,
-                Ok(Async::NotReady) => break,
-                Ok(Async::Ready(None)) => Err(format!("Interval stream ended?"))?,
-                Ok(Async::Ready(Some(_t))) => {
-                    self.send_allocate_request();
-                    continue;
-                },
-            }
-        }
-
-        Ok(Async::NotReady) // don't care which one in particular is not ready
+            return Ok(Async::NotReady) // don't care which one in particular is not ready
+        } // loop
     }
 }
 
