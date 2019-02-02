@@ -24,9 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp = tokio::net::udp::UdpSocket::bind(&local_addr)?;
 
     let c = turnclient::TurnClientBuilder::new(turn_server, username, password);
-    let f = c.allocate(udp)
+    let f = c.build_and_send_request(udp)
     .and_then(|turnclient| {
-        turnclient.for_each(|_| {
+        turnclient.for_each(|x| {
+            println!("{:?}", x);
             futures::future::ok(())
         })
     })

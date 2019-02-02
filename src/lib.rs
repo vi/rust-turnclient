@@ -22,9 +22,13 @@ use stun_codec::rfc5389::attributes::{
     ErrorCode,
     MessageIntegrity,
     Username,
+    XorMappedAddress,
+    AlternateServer,
 };
 use stun_codec::rfc5766::attributes::{
-    RequestedTransport
+    RequestedTransport,
+    XorRelayAddress,
+    Lifetime,
 };
 //use stun_codec::rfc5389::{Attribute as StunAttribute};
 //use stun_codec::rfc5766::{Attribute as TurnAttribute};
@@ -119,7 +123,7 @@ impl TurnClientBuilder {
 
     // too lazy to bring in builder pattern methods now
 
-    pub fn allocate(self, udp: UdpSocket) -> impl Future<Item=TurnClient, Error=Error> {
+    pub fn build_and_send_request(self, udp: UdpSocket) -> impl Future<Item=TurnClient, Error=Error> {
         let retry_timer = Interval::new_interval(self.retry_interval);
         let tc = TurnClient{
             opts: self,
@@ -127,7 +131,7 @@ impl TurnClientBuilder {
             retry_timer,
             trans_id: gen_transaction_id(),
             data_to_be_sent_while_polling: None,
-            allocated: false,
+            allocation_lifetime: None,
             realm: None,
             nonce: None,
         };
@@ -138,8 +142,21 @@ impl TurnClientBuilder {
     }
 }
 
+#[derive(Debug)]
 pub enum MessageFromTurnServer {
-    NothingSpecial,
+    /// This variant can be safely ignored
+    APacketIsReceivedAndAutomaticallyHandled,
+    
+    AllocationGranted {
+        relay_address: SocketAddr,
+        mapped_address: SocketAddr,
+        server_software: Option<String>,
+    },
+
+    RedirectedToAlternateServer(SocketAddr),
+
+    /// A packet from wrong address or an unexpected STUN/TURN message
+    ForeignPacket(SocketAddr, Vec<u8>),
 }
 
 pub struct TurnClient {
@@ -148,7 +165,8 @@ pub struct TurnClient {
     retry_timer: Interval,
     trans_id: TransactionId,
     data_to_be_sent_while_polling: Option<Vec<u8>>,
-    allocated: bool,
+    /// None means not yet allocated
+    allocation_lifetime: Option<Instant>,
     realm: Option<Realm>,
     nonce: Option<Nonce>,
 }
@@ -167,6 +185,7 @@ fn gen_transaction_id() -> TransactionId {
 }
 
 impl TurnClient {
+    /// Send allocate or refresh request
     fn send_allocate_request(&mut self) -> Result<(), Error> {
         assert!(self.data_to_be_sent_while_polling == None);
         let mut message : Message<Attribute> = Message::new(MessageClass::Request, ALLOCATE, self.trans_id);
@@ -176,7 +195,6 @@ impl TurnClient {
                 s.to_owned(),
             )?));
         }
-
         
         message.add_attribute(Attribute::RequestedTransport(
             RequestedTransport::new(17 /* UDP */)
@@ -214,6 +232,85 @@ impl TurnClient {
 
         Ok(())
     }
+
+    /// Handle incoming packet from TURN server
+    fn handle_incoming_packet(&mut self, buf:&[u8]) -> Result<MessageFromTurnServer, Error> {
+        use self::MessageFromTurnServer::*;
+
+        if self.allocation_lifetime.is_none() {
+            let mut decoder = MessageDecoder::<Attribute>::new();
+
+            let decoded = decoder
+                .decode_from_bytes(buf)?
+                .map_err(|_| format!("Broken TURN reply"))?;
+            if decoded.transaction_id() != self.trans_id {
+                return Ok(ForeignPacket(self.opts.turn_server, buf.to_vec()));
+            }
+            
+            use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
+            match decoded.class() {
+                SuccessResponse => {
+                    let ra = decoded.get_attribute::<XorRelayAddress>().ok_or("No XorRelayAddress in reply")?;
+                    let ma = decoded.get_attribute::<XorMappedAddress>().ok_or("No XorMappedAddress in reply")?;
+                    let sw = decoded.get_attribute::<Software>().as_ref().map(|x|x.description());
+                    let lt = decoded.get_attribute::<Lifetime>().ok_or("No Lifetime in reply")?;
+
+                    /* Big mode change */
+                    self.allocation_lifetime = Some(Instant::now() + lt.lifetime());
+                    /* Big mode echange */
+
+                    let ret = AllocationGranted {
+                        relay_address: ra.address(),
+                        mapped_address: ma.address(),
+                        server_software: sw.map(|x|x.to_owned()),
+                    };
+                    return Ok(ret)
+                },
+                ErrorResponse => {
+                    let ec = decoded.get_attribute::<ErrorCode>()
+                            .ok_or("ErrorResponse without ErrorCode?")?.code();
+
+                    match ec {
+                        401 => {
+                            if self.nonce.is_some() {
+                                Err("Authentication failed")?;
+                            }
+
+                            let re = decoded.get_attribute::<Realm>()
+                                    .ok_or("Missing Realm in NotAuthorized response")?;
+                            let no = decoded.get_attribute::<Nonce>()
+                                    .ok_or("Missing Nonce in NotAuthorized response")?;
+                            
+                            self.realm = Some(re.clone());
+                            self.nonce = Some(no.clone());
+
+                            self.trans_id = gen_transaction_id();
+                            self.send_allocate_request();
+                        },
+                        300 => {
+                            let ta = decoded.get_attribute::<AlternateServer>()
+                                    .ok_or("Redirect without AlternateServer")?;
+                            return Ok(RedirectedToAlternateServer(ta.address()));
+                        },
+                        _ => {
+                            Err(format!("Unknown error code from TURN: {}", ec))?;
+                        }
+                    }
+                },
+                Indication => {
+                    Err("Indications are not expected in this state")?
+                },
+                Request => {
+                    Err("Received a Request instead of Response from server")?
+                },
+            }
+        } else {
+            Err("Not implemented: life after allocation")?
+            // TODO
+        }
+        
+        Ok(MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled)
+    }
 }
 
 impl Stream for TurnClient {
@@ -228,52 +325,12 @@ impl Stream for TurnClient {
                 Err(e) => Err(e)?,
                 Ok(Async::NotReady) => break,
                 Ok(Async::Ready((len, addr))) => {
+                    let buf = &buf[0..len];
                     if addr != self.opts.turn_server {
-                        // TODO: log something here
-                        continue;
+                        return Ok(Async::Ready(Some(MessageFromTurnServer::ForeignPacket(addr,buf.to_vec()))));
                     }
-
-                    if !self.allocated {
-                        let buf = &buf[0..len];
-                        let mut decoder = MessageDecoder::<Attribute>::new();
-
-                        let decoded = decoder
-                            .decode_from_bytes(buf)?
-                            .map_err(|_| format!("Broken TURN reply"))?;
-                        if decoded.transaction_id() != self.trans_id {
-                            // TODO: log something here
-                            continue;
-                        }
-
-                        let ec = decoded.get_attribute::<ErrorCode>();
-
-                        if let Some(ec) = ec {
-                            if ec.code() == 401 {
-                                if self.nonce.is_some() {
-                                    Err(format!("Authentication failed"))?;
-                                }
-
-                                let re = decoded.get_attribute::<Realm>();
-                                let no = decoded.get_attribute::<Nonce>();
-
-                                match (re,no) {
-                                    (Some(re), Some(no)) => {
-                                        self.realm = Some(re.clone());
-                                        self.nonce = Some(no.clone());
-                                    },
-                                    _ => {
-                                        Err(format!("TURN Realm or Nonce is missing"))?;
-                                    }
-                                }
-                            } else {
-                                Err(format!("TURN error {:?}", ec))?;
-                            }
-                            return Ok(Async::Ready(Some(MessageFromTurnServer::NothingSpecial)));
-                        } else {
-                            eprintln!("{:?}", decoded);
-                            Err(format!("unimplemented"))?;
-                        }
-                    }
+                    let ret = self.handle_incoming_packet(buf)?;
+                    return Ok(Async::Ready(Some(ret)));
                 },
             }
         }
