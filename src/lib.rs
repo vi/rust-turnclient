@@ -1,5 +1,7 @@
 #![allow(unused)]
 
+const PERM_REFRESH_INTERVAL : u64 = 180;
+
 extern crate bytecodec;
 #[macro_use]
 extern crate stun_codec;
@@ -366,14 +368,20 @@ impl TurnClient {
         message.add_attribute(Attribute::XorPeerAddress(
             XorPeerAddress::new(p.addr)
         ));
-        let a = p.addr;
+
+        let hook : CompletionHook = Box::new(move |_self|{
+            let p = &mut _self.permissions[h];
+            let msg = if p.creation_already_reported {
+                MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled
+            } else {
+                p.creation_already_reported = true;
+                MessageFromTurnServer::PermissionCreated(p.addr)
+            };
+            Ok(Some(msg))
+        });
 
         self.sign_request(&mut message)?;
-        let h : CompletionHook = Box::new(move |_self|{
-            // TODO: emit this conditionally
-            Ok(Some(MessageFromTurnServer::PermissionCreated(a)))
-        });
-        self.file_request(transid, message, Some(h))?;
+        self.file_request(transid, message, Some(hook))?;
     
         Ok(())
     }
@@ -585,7 +593,25 @@ impl Stream for TurnClient {
             }
 
             // 4. Refresh channels and permissions periodically
-            // (includes initial send as well)
+            let mut ids_to_refresh = vec![];
+            if let Some(pp) = &mut self.permissions_pinger {
+                match pp.poll() {
+                    Err(e)=>Err(e)?,
+                    Ok(Async::NotReady) => (),
+                    Ok(Async::Ready(_instant)) => {
+                        for (h, _) in self.permissions.iter() {
+                            ids_to_refresh.push(h);
+                        }
+                    },
+                }
+            }
+            if !ids_to_refresh.is_empty() {
+                for h in ids_to_refresh {
+                    // TODO: send multiple addresses per request, not one by one
+                    self.send_perm_request(h)?;
+                }
+                continue 'main;
+            }
             
 
             return Ok(Async::NotReady) // don't care which one in particular is not ready
@@ -603,7 +629,6 @@ impl Sink for TurnClient {
             Noop => (),
             AddPermission(sa) => {
                 if self.permissions_pinger.is_none() {
-                    const PERM_REFRESH_INTERVAL : u64 = 180;
                     self.permissions_pinger = Some(Interval::new_interval(Duration::from_secs(PERM_REFRESH_INTERVAL)));
                 }
 
