@@ -34,7 +34,7 @@ use stun_codec::rfc5766::attributes::{
 };
 //use stun_codec::rfc5389::{Attribute as StunAttribute};
 //use stun_codec::rfc5766::{Attribute as TurnAttribute};
-use stun_codec::rfc5766::methods::{ALLOCATE};
+use stun_codec::rfc5766::methods::{ALLOCATE, REFRESH};
 use stun_codec::{Message, MessageClass, TransactionId};
 use std::time::{Instant,Duration};
 use self::attrs::Attribute;
@@ -100,9 +100,9 @@ pub struct TurnClientBuilder {
     /// Password for TURN authentication
     pub password: String,
 
-    /// "End-to-end" timeout for the initial allocation operation.
-    pub alloc_timeout: Duration,
-    /// How often to repeat varions requests
+    /// Maximum number of retries for any request
+    pub max_retries: usize,
+    /// How often to retry varions requests
     pub retry_interval: Duration,
     /// How often to renew the allocation
     pub refresh_interval: Duration,
@@ -118,9 +118,9 @@ impl TurnClientBuilder {
             turn_server,
             username,
             password,
-            alloc_timeout: Duration::from_secs(15),
+            max_retries: 10,
             retry_interval: Duration::from_secs(1),
-            refresh_interval: Duration::from_secs(60),
+            refresh_interval: Duration::from_secs(30),
             software: Some("SimpleRustTurnClient"),
         }
     }
@@ -134,7 +134,7 @@ impl TurnClientBuilder {
 
             inflight: HashMap::with_capacity_and_hasher(2, Default::default()),
 
-            allocation_lifetime: None,
+            when_to_renew_the_allocation: None,
             realm: None,
             nonce: None,
         };
@@ -165,10 +165,15 @@ pub enum MessageFromTurnServer {
 enum InflightRequestStatus {
     SendNow,
     RetryLater(Delay),
+    TimedOut,
 }
 
 /// Unaccepted request being retried
-struct InflightRequest(InflightRequestStatus, Vec<u8>);
+struct InflightRequest {
+    status: InflightRequestStatus,
+    data: Vec<u8>,
+    retryctr: usize,
+}
 
 pub struct TurnClient {
     opts: TurnClientBuilder,
@@ -177,7 +182,8 @@ pub struct TurnClient {
     inflight: HashMap<TransactionId, InflightRequest>,
 
     /// None means not yet allocated
-    allocation_lifetime: Option<Instant>,
+    /// 
+    when_to_renew_the_allocation: Option<Delay>,
     realm: Option<Realm>,
     nonce: Option<Nonce>,
 }
@@ -199,7 +205,13 @@ impl TurnClient {
     /// Send allocate or refresh request
     fn send_allocate_request(&mut self) -> Result<(), Error> {
         let transid = gen_transaction_id();
-        let mut message : Message<Attribute> = Message::new(MessageClass::Request, ALLOCATE, transid);
+
+        let method = if self.when_to_renew_the_allocation.is_none() {
+            ALLOCATE
+        } else {
+            REFRESH
+        };
+        let mut message : Message<Attribute> = Message::new(MessageClass::Request, method, transid);
               
         if let Some(s) = self.opts.software {
             message.add_attribute(Attribute::Software(Software::new(
@@ -207,9 +219,11 @@ impl TurnClient {
             )?));
         }
         
-        message.add_attribute(Attribute::RequestedTransport(
-            RequestedTransport::new(17 /* UDP */)
-        ));
+        if method == ALLOCATE {
+            message.add_attribute(Attribute::RequestedTransport(
+                RequestedTransport::new(17 /* UDP */)
+            ));
+        }
         
 
         let username = Username::new(self.opts.username.clone())?;
@@ -235,7 +249,11 @@ impl TurnClient {
         let mut encoder = MessageEncoder::new();
         let bytes = encoder.encode_into_bytes(message.clone())?;
 
-        let rq = InflightRequest(InflightRequestStatus::SendNow, bytes);
+        let rq = InflightRequest {
+            status: InflightRequestStatus::SendNow,
+            data: bytes,
+            retryctr: 0,
+        };
         self.inflight.insert(transid, rq);
     
         Ok(())
@@ -258,7 +276,7 @@ impl TurnClient {
             self.inflight.remove(&decoded.transaction_id());
         }
 
-        if self.allocation_lifetime.is_none() {
+        if self.when_to_renew_the_allocation.is_none() {
             use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
             match decoded.class() {
                 SuccessResponse => {
@@ -267,9 +285,20 @@ impl TurnClient {
                     let sw = decoded.get_attribute::<Software>().as_ref().map(|x|x.description());
                     let lt = decoded.get_attribute::<Lifetime>().ok_or("No Lifetime in reply")?;
 
-                    /* Big mode change */
-                    self.allocation_lifetime = Some(Instant::now() + lt.lifetime());
-                    /* Big mode echange */
+                    let mut lt = lt.lifetime();
+                    if lt < Duration::from_secs(90) {
+                        lt = Duration::from_secs(5);
+                    } else {
+                        lt = lt - Duration::from_secs(60);
+                    }
+                    if lt > self.opts.refresh_interval {
+                        lt = self.opts.refresh_interval;
+                    }
+
+                    /* Big state change */
+                    self.when_to_renew_the_allocation = 
+                        Some(Delay::new(Instant::now() + lt));
+                    /* Big state echange */
 
                     let ret = AllocationGranted {
                         relay_address: ra.address(),
@@ -329,8 +358,7 @@ impl Stream for TurnClient {
     type Item = MessageFromTurnServer;
 
     fn poll(&mut self) -> Poll<Option<MessageFromTurnServer>, Error> {
-        // Receiving things is the first priority
-        loop {
+        'main: loop {
             let mut buf = [0; 512];
             match self.udp.poll_recv_from(&mut buf[..]) {
                 Err(e) => Err(e)?,
@@ -345,16 +373,23 @@ impl Stream for TurnClient {
                 },
             }
 
-            for (_, rq) in &mut self.inflight {
-                match &mut rq.0 {
+            let mut remove_this_stale_rqs = vec![];
+            for (k, rq) in &mut self.inflight {
+                match &mut rq.status {
+                    InflightRequestStatus::TimedOut => {
+                        remove_this_stale_rqs.push(*k);
+                    },
                     InflightRequestStatus::SendNow => {
-                        match self.udp.poll_send_to(&rq.1[..], &self.opts.turn_server) {
+                        match self.udp.poll_send_to(&rq.data[..], &self.opts.turn_server) {
                             Err(e)=>Err(e)?,
                             Ok(Async::NotReady)=>(),
                             Ok(Async::Ready(len)) => {
-                                assert_eq!(len, rq.1.len());
-                                rq.0 = InflightRequestStatus::RetryLater(Delay::new(Instant::now() + self.opts.retry_interval));
-                                continue;
+                                assert_eq!(len, rq.data.len());
+                                let mut d = Delay::new(Instant::now() + self.opts.retry_interval);
+                                //let _ = d.poll(); // register it now, don't rely on implicits
+                                rq.status = InflightRequestStatus::RetryLater(d);
+
+                                continue 'main;
                             },
                         }
                     },
@@ -363,10 +398,32 @@ impl Stream for TurnClient {
                             Err(e)=>Err(e)?,
                             Ok(Async::NotReady)=>(),
                             Ok(Async::Ready(())) => {
-                                rq.0 = InflightRequestStatus::SendNow;
-                                continue;
+                                rq.retryctr += 1;
+                                if rq.retryctr >= self.opts.max_retries {
+                                    rq.status = InflightRequestStatus::TimedOut;
+                                    Err("Request timed out")?;
+                                } else {
+                                    rq.status = InflightRequestStatus::SendNow;
+                                    continue 'main;
+                                }
                             }
                         }
+                    },
+                }
+            }
+            for rm in remove_this_stale_rqs {
+                self.inflight.remove(&rm);
+            }
+
+            if let Some(x) = &mut self.when_to_renew_the_allocation {
+                match x.poll() {
+                    Err(e)=>Err(e)?,
+                    Ok(Async::NotReady) => (),
+                    Ok(Async::Ready(())) => {
+                        let ri = self.opts.refresh_interval;
+                        x.reset(Instant::now() + ri);
+                        self.send_allocate_request();
+                        continue 'main;
                     },
                 }
             }
