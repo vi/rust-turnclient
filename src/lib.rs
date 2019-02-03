@@ -39,7 +39,7 @@ use stun_codec::{Message, MessageClass, TransactionId};
 use std::time::{Instant,Duration};
 use self::attrs::Attribute;
 
-use futures::{Stream, Sink, Future, Poll, Async};
+use futures::{Stream, Sink, Future, Poll, Async, StartSend, AsyncSink};
 
 use fnv::FnvHashMap as HashMap;
 
@@ -168,6 +168,16 @@ enum InflightRequestStatus {
     TimedOut,
 }
 
+/// Requests and indications to be sent to TURN server
+#[derive(Debug)]
+pub enum MessageToTurnServer {
+    /// Ignored
+    Noop,
+    /// Grant access for this SocketAddr (external UDP ip:port) to send us datagrams
+    /// (and for us to send datagrams to it)
+    AddPermission(SocketAddr),
+}
+
 /// Unaccepted request being retried
 struct InflightRequest {
     status: InflightRequestStatus,
@@ -188,6 +198,12 @@ pub struct TurnClient {
     nonce: Option<Nonce>,
 }
 
+/// Simple TURN client in form of `Stream<Item=MessageFromTurnServer>` and `Sink<SinkItem=MessageToTurnServer>`.
+/// 
+/// Stream side should be continually polled, or the client expires.
+/// Requests are actually sent by `Stream`'s poll.
+/// 
+/// Use `Stream::split`.
 impl TurnClient {
     /// Consume this TURN client, returning back control of used UDP socket
     pub fn into_udp_socket(self) -> UdpSocket {
@@ -463,6 +479,19 @@ impl Stream for TurnClient {
     }
 }
 
+impl Sink for TurnClient {
+    type SinkItem = MessageToTurnServer;
+    type SinkError = Error;
+
+    fn start_send(&mut self, msg: MessageToTurnServer) -> StartSend<MessageToTurnServer,Error> {
+        Ok(AsyncSink::Ready)
+    }
+
+    fn poll_complete(&mut self) -> Poll<(),Error> {
+        // I always initially unsure about what to put to poll_complete
+        Ok(Async::Ready(()))
+    }
+}
 
 #[cfg(test)]
 mod tests {

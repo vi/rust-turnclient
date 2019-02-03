@@ -25,9 +25,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let c = turnclient::TurnClientBuilder::new(turn_server, username, password);
     let f = c.build_and_send_request(udp)
-    .and_then(|turnclient| {
-        turnclient.for_each(|x| {
+    .and_then(|turncl| {
+        let (turnsink, turnstream) = turncl.split();
+        turnstream.map(|x| {
             println!("{:?}", x);
+            match x {
+                turnclient::MessageFromTurnServer::AllocationGranted{..} => {
+                    println!("Requesting perm");
+                    let sa : std::net::SocketAddr = "127.0.0.1:2001".parse().unwrap();
+                    turnclient::MessageToTurnServer::AddPermission(sa)
+                },
+                _ => turnclient::MessageToTurnServer::Noop,
+            }
+        }).forward(turnsink)
+        .and_then(|(_turnstream,_turnsink)|{
             futures::future::ok(())
         })
     })
