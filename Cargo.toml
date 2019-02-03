@@ -19,6 +19,7 @@ tokio-udp = { version = "0.1.3", optional = false }
 tokio-timer = { version = "0.2.9", optional = false }
 trackable = "0.2"
 fnv = "1.0.6"
+slab_typesafe = "0.1.3"
 
 [dev-dependencies]
 tokio = "0.1.15"
