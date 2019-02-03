@@ -259,6 +259,18 @@ impl TurnClient {
         Ok(())
     }
 
+    fn process_alloc_lifetime(&self, mut lt: Duration) -> Duration {
+        if lt < Duration::from_secs(90) {
+            lt = Duration::from_secs(5);
+        } else {
+            lt = lt - Duration::from_secs(60);
+        }
+        if lt > self.opts.refresh_interval {
+            lt = self.opts.refresh_interval;
+        }
+        lt
+    }
+
     /// Handle incoming packet from TURN server
     fn handle_incoming_packet(&mut self, buf:&[u8]) -> Result<MessageFromTurnServer, Error> {
         use self::MessageFromTurnServer::*;
@@ -276,8 +288,8 @@ impl TurnClient {
             self.inflight.remove(&decoded.transaction_id());
         }
 
+        use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
         if self.when_to_renew_the_allocation.is_none() {
-            use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
             match decoded.class() {
                 SuccessResponse => {
                     let ra = decoded.get_attribute::<XorRelayAddress>().ok_or("No XorRelayAddress in reply")?;
@@ -285,15 +297,7 @@ impl TurnClient {
                     let sw = decoded.get_attribute::<Software>().as_ref().map(|x|x.description());
                     let lt = decoded.get_attribute::<Lifetime>().ok_or("No Lifetime in reply")?;
 
-                    let mut lt = lt.lifetime();
-                    if lt < Duration::from_secs(90) {
-                        lt = Duration::from_secs(5);
-                    } else {
-                        lt = lt - Duration::from_secs(60);
-                    }
-                    if lt > self.opts.refresh_interval {
-                        lt = self.opts.refresh_interval;
-                    }
+                    let lt = self.process_alloc_lifetime(lt.lifetime());
 
                     /* Big state change */
                     self.when_to_renew_the_allocation = 
@@ -345,8 +349,35 @@ impl TurnClient {
                 },
             }
         } else {
-            Err("Not implemented: life after allocation")?
-            // TODO
+            // There is an allocation currently
+            match decoded.class() {
+                SuccessResponse => {
+                    match decoded.method() {    
+                        REFRESH => {
+                            let lt = decoded.get_attribute::<Lifetime>().ok_or("No Lifetime in reply")?;
+                            let lt = self.process_alloc_lifetime(lt.lifetime());
+                            self.when_to_renew_the_allocation = 
+                                Some(Delay::new(Instant::now() + lt));
+                        },
+                        x => {
+                            Err(format!("Not implemented: success response for {:?}", x))?
+                        },
+                    }
+                },
+                ErrorResponse => {
+                    let ec = decoded.get_attribute::<ErrorCode>()
+                            .ok_or("ErrorResponse without ErrorCode?")?.code();
+                    
+                    Err(format!("Error from TURN: {}", ec))?;
+                },
+                Indication => {
+                    Err("Not implemented: handling indications")?
+                },
+                Request => {
+                    Err("Received a Request instead of Response from server")?
+                },
+            }
+            
         }
         
         Ok(MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled)
