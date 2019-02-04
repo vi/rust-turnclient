@@ -157,9 +157,10 @@ impl TurnClientBuilder {
             permissions: Slab::with_capacity(1),
 
             permissions_pinger: None,
+            shutdown: false,
         };
         futures::future::ok(tc).and_then(|mut tc| {
-            let _ = tc.send_allocate_request();
+            let _ = tc.send_allocate_request(false);
             futures::future::ok(tc)
         })
     }
@@ -186,6 +187,9 @@ pub enum MessageFromTurnServer {
 
     /// Incoming datagram from peer, regardless of channel usage
     RecvFrom(SocketAddr, Vec<u8>),
+
+    /// Reaction to the `Disconnect` message
+    Disconnected,
 }
 
 enum InflightRequestStatus {
@@ -206,6 +210,9 @@ pub enum MessageToTurnServer {
 
     /// Send this datagram to this peer
     SendTo(SocketAddr, Vec<u8>),
+
+    /// Expire the allocation and stop emitting new requests
+    Disconnect,
 }
 
 type CompletionHook = Box<FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error>>;
@@ -260,6 +267,7 @@ pub struct TurnClient {
     permissions: Slab<PermissionHandle, Permission>,
 
     permissions_pinger: Option<Interval>,
+    shutdown: bool,
 }
 
 /// Simple TURN client in form of `Stream<Item=MessageFromTurnServer>` and `Sink<SinkItem=MessageToTurnServer>`.
@@ -270,6 +278,8 @@ pub struct TurnClient {
 /// Use `Stream::split`.
 impl TurnClient {
     /// Consume this TURN client, returning back control of used UDP socket
+    /// Does not expire the allocation, so expect datagrams to keep on coming from
+    /// TURN server
     pub fn into_udp_socket(self) -> UdpSocket {
         self.udp
     }
@@ -283,7 +293,7 @@ fn gen_transaction_id() -> TransactionId {
 
 impl TurnClient {
     /// Send allocate or refresh request
-    fn send_allocate_request(&mut self) -> Result<(), Error> {
+    fn send_allocate_request(&mut self, shutdown: bool) -> Result<(), Error> {
         let transid = gen_transaction_id();
 
         let method = if self.when_to_renew_the_allocation.is_none() {
@@ -302,6 +312,12 @@ impl TurnClient {
         if method == ALLOCATE {
             message.add_attribute(Attribute::RequestedTransport(
                 RequestedTransport::new(17 /* UDP */)
+            ));
+        }
+
+        if shutdown {
+            message.add_attribute(Attribute::Lifetime(
+                Lifetime::new(Duration::from_secs(0))?
             ));
         }
         
@@ -350,6 +366,9 @@ impl TurnClient {
                 message: Message<Attribute>,
                 completion_hook: Option<CompletionHook>,
     ) -> Result<(),Error> {
+        if self.shutdown {
+            return Ok(())
+        }
         // Encodes the message
         let mut encoder = MessageEncoder::new();
         let bytes = encoder.encode_into_bytes(message)?;
@@ -504,7 +523,7 @@ impl TurnClient {
                             self.realm = Some(re.clone());
                             self.nonce = Some(no.clone());
 
-                            self.send_allocate_request();
+                            self.send_allocate_request(false);
                         },
                         300 => {
                             let ta = decoded.get_attribute::<AlternateServer>()
@@ -530,7 +549,15 @@ impl TurnClient {
                     match decoded.method() {    
                         REFRESH => {
                             let lt = decoded.get_attribute::<Lifetime>().ok_or("No Lifetime in reply")?;
+                            
+                            if lt.lifetime() == Duration::from_secs(0) {
+                                self.when_to_renew_the_allocation = None;
+                                self.shutdown = true;
+                                return Ok(MessageFromTurnServer::Disconnected);
+                            }
+
                             let lt = self.process_alloc_lifetime(lt.lifetime());
+
                             self.when_to_renew_the_allocation = 
                                 Some(Delay::new(Instant::now() + lt));
                         },
@@ -568,6 +595,10 @@ impl Stream for TurnClient {
 
     fn poll(&mut self) -> Poll<Option<MessageFromTurnServer>, Error> {
         'main: loop {
+            if self.shutdown {
+                return Ok(Async::Ready(None));
+            }
+
             let mut buf = [0; 1560];
             // TURN client's jobs (running in parallel):
             // 1. Handle incoming packets
@@ -638,7 +669,7 @@ impl Stream for TurnClient {
                     Ok(Async::Ready(())) => {
                         let ri = self.opts.refresh_interval;
                         x.reset(Instant::now() + ri);
-                        self.send_allocate_request();
+                        self.send_allocate_request(false);
                         continue 'main;
                     },
                 }
@@ -676,6 +707,9 @@ impl Sink for TurnClient {
     type SinkError = Error;
 
     fn start_send(&mut self, msg: MessageToTurnServer) -> StartSend<MessageToTurnServer,Error> {
+        if self.shutdown {
+            return Ok(AsyncSink::Ready);
+        }
         use self::MessageToTurnServer::*;
         match msg {
             Noop => (),
@@ -701,6 +735,9 @@ impl Sink for TurnClient {
                     },
                 }
                 self.send_data_indication(sa, data)?;
+            },
+            Disconnect => {
+                self.send_allocate_request(true)?;
             },
         }
         Ok(AsyncSink::Ready)

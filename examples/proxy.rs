@@ -38,7 +38,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 turnclient::MessageFromTurnServer::RecvFrom(sa,data) => {
                     println!("Incoming {} bytes from {}", data.len(), sa);
-                    turnclient::MessageToTurnServer::SendTo(sa, data)
+                    //turnclient::MessageToTurnServer::SendTo(sa, data)
+                    turnclient::MessageToTurnServer::Disconnect
                 },
                 _ => turnclient::MessageToTurnServer::Noop,
             }
