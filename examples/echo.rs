@@ -9,6 +9,8 @@ use std::net::{SocketAddr};
 use tokio::net::udp::UdpSocket;
 use tokio::prelude::{Future,Stream};
 
+use turnclient::{ChannelUsage,MessageFromTurnServer,MessageToTurnServer};
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args : Vec<String> = std::env::args().collect();
     if args.len() != 5 {
@@ -32,16 +34,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //println!("{:?}", x);
             print!(".");
             match x {
-                turnclient::MessageFromTurnServer::AllocationGranted{..} => {
+                MessageFromTurnServer::AllocationGranted{..} => {
                     println!("Allocation granted: {:?}", x);
-                    turnclient::MessageToTurnServer::AddPermission(peer_addr)
+                    MessageToTurnServer::AddPermission(peer_addr, ChannelUsage::WithChannel)
                 },
-                turnclient::MessageFromTurnServer::RecvFrom(sa,data) => {
+                MessageFromTurnServer::RecvFrom(sa,data) => {
                     println!("Incoming {} bytes from {}", data.len(), sa);
-                    //turnclient::MessageToTurnServer::SendTo(sa, data)
-                    turnclient::MessageToTurnServer::Disconnect
+                    MessageToTurnServer::SendTo(sa, data)
+                    //turnclient::MessageToTurnServer::Disconnect
                 },
-                _ => turnclient::MessageToTurnServer::Noop,
+                _ => MessageToTurnServer::Noop,
             }
         }).forward(turnsink)
         .and_then(|(_turnstream,_turnsink)|{
