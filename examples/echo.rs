@@ -27,10 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp = tokio::net::udp::UdpSocket::bind(&local_addr)?;
 
     let c = turnclient::TurnClientBuilder::new(turn_server, username, password);
-    let f = c.build_and_send_request(udp)
-    .and_then(move |turncl| {
-        let (turnsink, turnstream) = turncl.split();
-        turnstream.map(move |x| {
+    let (turnsink, turnstream) = c.build_and_send_request(udp).split();
+    let f = turnstream.map(move |x| {
             //println!("{:?}", x);
             print!(".");
             match x {
@@ -49,9 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|(_turnstream,_turnsink)|{
             futures::future::ok(())
         })
-    })
-    .map_err(|e|eprintln!("{}", e))
-    ;
+        .map_err(|e|eprintln!("{}", e));
 
     tokio::runtime::current_thread::run(f);
 

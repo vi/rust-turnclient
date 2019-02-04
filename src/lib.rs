@@ -1,4 +1,4 @@
-
+#![deny(missing_docs)]
 
 //! Simple async TURN client.
 //! 
@@ -174,8 +174,10 @@ impl TurnClientBuilder {
 
     // too lazy to bring in builder pattern methods now
 
-    pub fn build_and_send_request(self, udp: UdpSocket) -> impl Future<Item=TurnClient, Error=Error> {
-        let tc = TurnClient{
+    /// Finish setting options and get object to be polled.
+    /// Does not actually send the allocate request until returned `TurnClient` is polled.
+    pub fn build_and_send_request(self, udp: UdpSocket) -> TurnClient {
+        let mut tc = TurnClient{
             opts: self,
             udp,
 
@@ -191,37 +193,48 @@ impl TurnClientBuilder {
             permissions_pinger: None,
             shutdown: false,
         };
-        futures::future::ok(tc).and_then(|mut tc| {
-            let _ = tc.send_allocate_request(false);
-            futures::future::ok(tc)
-        })
+        tc.send_allocate_request(false).unwrap();
+        tc
     }
 }
 
+/// Callbacks from `TurnServer`
 #[derive(Debug)]
 pub enum MessageFromTurnServer {
-    /// This variant can be safely ignored
-    APacketIsReceivedAndAutomaticallyHandled,
-    
+    /// Setup is finished. Don't send AddPermission until this event arrives.
     AllocationGranted {
+        /// Address and port that is allocated for us by the TURN server.
+        /// Permitted hosts may send to it and we'll receive `RecvFrom` message.
         relay_address: SocketAddr,
+        /// External IP address and port of UDP socket used to contact TURN server.
+        /// Probably useless, unless you also want to try direct, non-TURN NAT traversal.
         mapped_address: SocketAddr,
+        /// SERVER attribute returned by TURN server, if any.
         server_software: Option<String>,
     },
 
+    /// Server is busy and requesting us to use alternative server.
+    /// The stream would end after this message.
     RedirectedToAlternateServer(SocketAddr),
-
-    /// A packet from wrong address or an unexpected STUN/TURN message
-    ForeignPacket(SocketAddr, Vec<u8>),
 
     /// Permission that you have requested by writing to sink has been successfully created.
     PermissionCreated(SocketAddr),
 
-    /// Incoming datagram from peer, regardless of channel usage
+    /// Incoming datagram from peer, regardless whether it comes from ChannelData or Indication.
     RecvFrom(SocketAddr, Vec<u8>),
 
-    /// Reaction to the `Disconnect` message
+    /// Reaction to the `Disconnect` message, received response with zero lifetime.
+    /// The stream would end after this message.
     Disconnected,
+
+    /// This variant can be safely ignored.
+    /// Each incoming packet from TURN server corresponds to some message here, you may
+    /// use this variant as a kind of watchdog that TURN server is operating normally
+    /// Expect this arrive each minute or so.
+    APacketIsReceivedAndAutomaticallyHandled,
+
+    /// A packet from wrong address or an unexpected STUN/TURN message or just malformed
+    ForeignPacket(SocketAddr, Vec<u8>),
 }
 
 enum InflightRequestStatus {
@@ -230,9 +243,13 @@ enum InflightRequestStatus {
     TimedOut,
 }
 
+/// Whether to just create permission of also allocate a channel for it.
+/// I don't see much reasons not to allocate a channel.
 #[derive(Debug,PartialEq,Eq,Ord,PartialOrd,Hash)]
 pub enum ChannelUsage {
+    /// Create a channel, resulting in shorter datagrams between you and TURN for this peer.
     WithChannel,
+    /// Only create permission and use send indications (more overhead compared to channel messages)
     JustPermission,
 }
 
@@ -290,6 +307,8 @@ struct Permission {
     creation_already_reported: bool,
 }
 
+/// The thing to be `split` to `Stream<Item=MessageFromTurnServer>` and `Sink<Item=MessageToTurnServer>`.
+/// Look at crate-level doc for more details.
 pub struct TurnClient {
     opts: TurnClientBuilder,
     udp: UdpSocket,
