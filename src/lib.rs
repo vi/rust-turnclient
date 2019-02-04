@@ -1,4 +1,4 @@
-#![allow(unused)]
+
 
 //! Simple async TURN client.
 //! 
@@ -78,7 +78,6 @@ use stun_codec::rfc5766::methods::{
     REFRESH,
     CREATE_PERMISSION,
     CHANNEL_BIND,
-    DATA,
     SEND,
 };
 use stun_codec::{Message, MessageClass, TransactionId};
@@ -632,7 +631,7 @@ impl TurnClient {
                             self.realm = Some(re.clone());
                             self.nonce = Some(no.clone());
 
-                            self.send_allocate_request(false);
+                            self.send_allocate_request(false)?;
                         },
                         300 => {
                             let ta = decoded.get_attribute::<AlternateServer>()
@@ -739,7 +738,7 @@ impl Stream for TurnClient {
                             Ok(Async::NotReady)=>(),
                             Ok(Async::Ready(len)) => {
                                 assert_eq!(len, rq.data.len());
-                                let mut d = Delay::new(Instant::now() + self.opts.retry_interval);
+                                let d = Delay::new(Instant::now() + self.opts.retry_interval);
                                 //let _ = d.poll(); // register it now, don't rely on implicits
                                 rq.status = InflightRequestStatus::RetryLater(d);
 
@@ -778,7 +777,7 @@ impl Stream for TurnClient {
                     Ok(Async::Ready(())) => {
                         let ri = self.opts.refresh_interval;
                         x.reset(Instant::now() + ri);
-                        self.send_allocate_request(false);
+                        self.send_allocate_request(false)?;
                         continue 'main;
                     },
                 }
