@@ -1,5 +1,36 @@
 #![allow(unused)]
 
+//! Simple async TURN client.
+//! 
+//! Usage:
+//! 
+//! 1. Create `TurnClientBuilder`
+//! 2. `build_and_send_request`
+//! 3. `split` the resulting thing to `Stream` and `Sink`
+//! 4. Wait for `AllocationGranted` event from Stream
+//! 5. Create permission or channel with `AddPermission` message
+//! 6. Send datagrams to the peer with a `SendTo` message to `TurnClient`'s `Sink` interface, receive datagrams from the peer by handling `RecvFrom` message from `TurnClient`'s `Stream` interface.
+//! 
+//! You may want to build a `stream -> map -> sink` chain using `Stream::forward` or `Sink::send_all`.
+//! 
+//! You need to handle errors from `Stream::poll`, otherwise somebody can DoS your client by sending tricky packets.
+//! 
+//! Not implemented / TODO / cons:
+//! 
+//! * Removing permissions. They keep on getting refreshed until you close the entire allocation.
+//! * Quadratical complexity, linear number of UDP datagrams in case of N actibe permissions.
+//! * TCP or TLS transport.
+//! * Using short-term credentials instead of long-term.
+//! * "Don't fragment" specifier on sent datagrams
+//! * Even/odd port allocation
+//! * Error handling is ad-hoc `Box<dyn std::error::Error>`, with just a text strings.
+//! * Message-integrity is not checked for server replies.
+//! * Allocation-heavy, uses Vec<u8> for byte buffers.
+//! 
+//! Examples:
+//! 
+//! * `echo.rs` - Connect to specified TURN server, authorize specified peer and act as an echo server for it.
+
 const PERM_REFRESH_INTERVAL : u64 = 180;
 
 extern crate bytecodec;
@@ -38,6 +69,7 @@ use stun_codec::rfc5766::attributes::{
     XorPeerAddress,
     Lifetime,
     Data,
+    ChannelNumber,
 };
 //use stun_codec::rfc5389::{Attribute as StunAttribute};
 //use stun_codec::rfc5766::{Attribute as TurnAttribute};
@@ -155,6 +187,7 @@ impl TurnClientBuilder {
             nonce: None,
 
             permissions: Slab::with_capacity(1),
+            sockaddr2perm: HashMap::with_capacity_and_hasher(1, Default::default()),
 
             permissions_pinger: None,
             shutdown: false,
@@ -198,6 +231,12 @@ enum InflightRequestStatus {
     TimedOut,
 }
 
+#[derive(Debug,PartialEq,Eq,Ord,PartialOrd,Hash)]
+pub enum ChannelUsage {
+    WithChannel,
+    JustPermission,
+}
+
 /// Requests and indications to be sent to TURN server
 #[derive(Debug)]
 pub enum MessageToTurnServer {
@@ -206,7 +245,7 @@ pub enum MessageToTurnServer {
 
     /// Grant access for this SocketAddr (external UDP ip:port) to send us datagrams
     /// (and for us to send datagrams to it)
-    AddPermission(SocketAddr),
+    AddPermission(SocketAddr, ChannelUsage),
 
     /// Send this datagram to this peer
     SendTo(SocketAddr, Vec<u8>),
@@ -265,6 +304,7 @@ pub struct TurnClient {
     nonce: Option<Nonce>,
 
     permissions: Slab<PermissionHandle, Permission>,
+    sockaddr2perm: HashMap<SocketAddr, PermissionHandle>,
 
     permissions_pinger: Option<Interval>,
     shutdown: bool,
@@ -390,7 +430,11 @@ impl TurnClient {
         
         let transid = gen_transaction_id();
 
-        let method = CREATE_PERMISSION;
+        let method = if p.channelized {
+            CHANNEL_BIND
+        } else {
+            CREATE_PERMISSION
+        };
         let mut message : Message<Attribute> = Message::new(MessageClass::Request, method, transid);
               
         if let Some(s) = self.opts.software {
@@ -402,6 +446,13 @@ impl TurnClient {
         message.add_attribute(Attribute::XorPeerAddress(
             XorPeerAddress::new(p.addr)
         ));
+
+        if p.channelized {
+            let chn = h.as_channel_number().ok_or("Channel number overflow")?;
+            message.add_attribute(Attribute::ChannelNumber(
+                ChannelNumber::new(chn)?
+            ));
+        }
 
         let hook : CompletionHook = Box::new(move |_self|{
             let p = &mut _self.permissions[h];
@@ -422,6 +473,27 @@ impl TurnClient {
     
     fn send_data_indication(&mut self, sa: SocketAddr, data: Vec<u8>) -> Result<(),Error> {
         
+        if let Some(p) = self.sockaddr2perm.get(&sa) {
+            if let Some(cn) = p.as_channel_number() {
+                let mut b = Vec::with_capacity(data.len() + 4);
+                let l = data.len();
+                b.push( ((cn & 0xFF00) >> 8) as u8);
+                b.push( ((cn & 0x00FF) >> 0) as u8);
+                b.push( ((l  & 0xFF00) >> 8) as u8);
+                b.push( ((l  & 0x00FF) >> 0) as u8);
+                b.extend_from_slice(&data[..]);
+
+                match self.udp.poll_send_to(&b[..], &self.opts.turn_server) {
+                    Err(e)=>Err(e)?,
+                    Ok(Async::NotReady) => Err("UDP socket became not write-ready after reporting readiness")?,
+                    Ok(Async::Ready(len)) => {
+                        assert_eq!(len, l+4)
+                    }
+                }
+                return Ok(())
+            }
+        }
+
         let transid = gen_transaction_id();
 
         let method = SEND;
@@ -452,6 +524,43 @@ impl TurnClient {
     fn handle_incoming_packet(&mut self, buf:&[u8]) -> Result<MessageFromTurnServer, Error> {
         use self::MessageFromTurnServer::*;
         use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
+
+        let mut foreign_packet = false;
+
+        // Handle incoming ChannelData:
+        if buf.len() < 4 {
+            foreign_packet = true;
+        } else {
+            if buf[0] >= 0x40 && buf[0] <= 0x7F {
+                let chnum = (buf[0] as u16)<<8  |  (buf[1] as u16);
+                let len = (buf[2] as u16) << 8 | (buf[3] as u16);
+
+                let h = PermissionHandle::from_channel_number(chnum);
+
+                if h.is_none() || buf.len() < (len as usize)+4 {
+                    foreign_packet = true;
+                } else {
+                    if let Some(p) = self.permissions.get(h.unwrap()) {
+                        return Ok(MessageFromTurnServer::RecvFrom(
+                            p.addr,
+                            buf[4..].to_vec(),
+                        ))
+                    } else {
+                        foreign_packet = true;
+                    } 
+                }
+            }
+        }
+
+        // Handle everything else:
+
+        if buf.len() < 18 {
+            foreign_packet = true;
+        }
+
+        if foreign_packet {
+            return Ok(ForeignPacket(self.opts.turn_server, buf.to_vec()));
+        }
 
         let mut decoder = MessageDecoder::<Attribute>::new();
 
@@ -536,7 +645,7 @@ impl TurnClient {
                     }
                 },
                 Indication => {
-                    Err("Indications are not expected in this state")?
+                    Err("Indication when not allocated anything")?
                 },
                 Request => {
                     Err("Received a Request instead of Response from server")?
@@ -713,17 +822,24 @@ impl Sink for TurnClient {
         use self::MessageToTurnServer::*;
         match msg {
             Noop => (),
-            AddPermission(sa) => {
+            AddPermission(sa, chusage) => {
                 if self.permissions_pinger.is_none() {
                     self.permissions_pinger = Some(Interval::new_interval(Duration::from_secs(PERM_REFRESH_INTERVAL)));
                 }
 
+                if chusage == ChannelUsage::WithChannel {
+                    if self.permissions.len() >= 0x3FFE {
+                        Err("There are too many permissions/channels to open another channel")?
+                    }
+                }
+
                 let p = Permission {
                     addr: sa,
-                    channelized: false,
+                    channelized: chusage == ChannelUsage::WithChannel,
                     creation_already_reported: false,
                 };
                 let id = self.permissions.insert(p);
+                self.sockaddr2perm.insert(sa, id);
                 self.send_perm_request(id)?;
             },
             SendTo(sa, data) => {
