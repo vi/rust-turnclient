@@ -37,10 +37,18 @@ use stun_codec::rfc5766::attributes::{
     XorRelayAddress,
     XorPeerAddress,
     Lifetime,
+    Data,
 };
 //use stun_codec::rfc5389::{Attribute as StunAttribute};
 //use stun_codec::rfc5766::{Attribute as TurnAttribute};
-use stun_codec::rfc5766::methods::{ALLOCATE, REFRESH, CREATE_PERMISSION, CHANNEL_BIND};
+use stun_codec::rfc5766::methods::{
+    ALLOCATE,
+    REFRESH,
+    CREATE_PERMISSION,
+    CHANNEL_BIND,
+    DATA,
+    SEND,
+};
 use stun_codec::{Message, MessageClass, TransactionId};
 use std::time::{Instant,Duration};
 use self::attrs::Attribute;
@@ -175,6 +183,9 @@ pub enum MessageFromTurnServer {
 
     /// Permission that you have requested by writing to sink has been successfully created.
     PermissionCreated(SocketAddr),
+
+    /// Incoming datagram from peer, regardless of channel usage
+    RecvFrom(SocketAddr, Vec<u8>),
 }
 
 enum InflightRequestStatus {
@@ -188,9 +199,13 @@ enum InflightRequestStatus {
 pub enum MessageToTurnServer {
     /// Ignored
     Noop,
+
     /// Grant access for this SocketAddr (external UDP ip:port) to send us datagrams
     /// (and for us to send datagrams to it)
     AddPermission(SocketAddr),
+
+    /// Send this datagram to this peer
+    SendTo(SocketAddr, Vec<u8>),
 }
 
 type CompletionHook = Box<FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error>>;
@@ -290,7 +305,7 @@ impl TurnClient {
             ));
         }
         
-        self.sign_request(&mut message)?; 
+        self.sign_request(&mut message)?;
         self.file_request(transid, message, None)?;
     
         Ok(())
@@ -385,10 +400,39 @@ impl TurnClient {
     
         Ok(())
     }
+    
+    fn send_data_indication(&mut self, sa: SocketAddr, data: Vec<u8>) -> Result<(),Error> {
+        
+        let transid = gen_transaction_id();
+
+        let method = SEND;
+        let mut message : Message<Attribute> = Message::new(MessageClass::Indication, method, transid);
+          
+        message.add_attribute(Attribute::XorPeerAddress(
+            XorPeerAddress::new(sa)
+        ));
+        message.add_attribute(Attribute::Data(
+            Data::new(data)?
+        ));
+        
+        let mut encoder = MessageEncoder::new();
+        let bytes = encoder.encode_into_bytes(message)?;
+
+        match self.udp.poll_send_to(&bytes[..], &self.opts.turn_server) {
+            Err(e)=>Err(e)?,
+            Ok(Async::NotReady) => Err("UDP socket became not write-ready after reporting readiness")?,
+            Ok(Async::Ready(len)) => {
+                assert_eq!(len, bytes.len())
+            }
+        }
+        
+        Ok(())
+    }
 
     /// Handle incoming packet from TURN server
     fn handle_incoming_packet(&mut self, buf:&[u8]) -> Result<MessageFromTurnServer, Error> {
         use self::MessageFromTurnServer::*;
+        use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
 
         let mut decoder = MessageDecoder::<Attribute>::new();
 
@@ -398,7 +442,16 @@ impl TurnClient {
 
         let tid = decoded.transaction_id();
 
-        // TODO: move it somewhere when starting handling Indication
+        if decoded.class() == Indication {
+            let pa = decoded.get_attribute::<XorPeerAddress>().ok_or("No XorPeerAddress in data indication")?;
+            let data = decoded.get_attribute::<Data>().ok_or("No Data attribute in indication")?;
+
+            return Ok(MessageFromTurnServer::RecvFrom(
+                pa.address(),
+                data.data().to_vec(),
+            ));
+        }
+
         if self.inflight.get(&tid).is_none() {
             return Ok(ForeignPacket(self.opts.turn_server, buf.to_vec()));
         } else {
@@ -410,7 +463,6 @@ impl TurnClient {
             }
         }
 
-        use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
         if self.when_to_renew_the_allocation.is_none() {
             // Not yet acquired an allocation
             match decoded.class() {
@@ -639,6 +691,16 @@ impl Sink for TurnClient {
                 };
                 let id = self.permissions.insert(p);
                 self.send_perm_request(id)?;
+            },
+            SendTo(sa, data) => {
+                match self.udp.poll_write_ready() {
+                    Err(e)=>Err(e)?,
+                    Ok(Async::Ready(_))=>(),
+                    Ok(Async::NotReady) => {
+                        return Ok(AsyncSink::NotReady(SendTo(sa,data)));
+                    },
+                }
+                self.send_data_indication(sa, data)?;
             },
         }
         Ok(AsyncSink::Ready)

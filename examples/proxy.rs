@@ -29,11 +29,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .and_then(move |turncl| {
         let (turnsink, turnstream) = turncl.split();
         turnstream.map(move |x| {
-            println!("{:?}", x);
+            //println!("{:?}", x);
+            print!(".");
             match x {
                 turnclient::MessageFromTurnServer::AllocationGranted{..} => {
-                    println!("Requesting perm");
+                    println!("Allocation granted: {:?}", x);
                     turnclient::MessageToTurnServer::AddPermission(peer_addr)
+                },
+                turnclient::MessageFromTurnServer::RecvFrom(sa,data) => {
+                    println!("Incoming {} bytes from {}", data.len(), sa);
+                    turnclient::MessageToTurnServer::SendTo(sa, data)
                 },
                 _ => turnclient::MessageToTurnServer::Noop,
             }
