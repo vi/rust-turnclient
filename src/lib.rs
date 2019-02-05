@@ -25,7 +25,7 @@
 //! * Even/odd port allocation
 //! * Error handling is ad-hoc `Box<dyn std::error::Error>`, with just a text strings.
 //! * Message-integrity is not checked for server replies.
-//! * Allocation-heavy, uses Vec<u8> for byte buffers.
+//! * Allocation-heavy, uses `Vec<u8>` for byte buffers.
 //! 
 //! Examples:
 //! 

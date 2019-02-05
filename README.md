@@ -1,4 +1,6 @@
-Simple Rust TURN client for UDP - traverse even strict NAT; async only currently
+Simple Rust TURN (RFC 5766) client for UDP - traverse even strict NAT; async only currently
+
+`<bonus>` A general-purpose TURN client/proxy, allowing to use TURN for custom things (you provide the scripts for signaling). There is a pre-built executable at Github releases.`</bonus>`.
 
 Cleaned-up example snippet:
 
@@ -31,8 +33,9 @@ Not implemented / TODO / cons:
 * Even/odd port allocation
 * Error handling is ad-hoc `Box<dyn std::error::Error>`, with just a text strings.
 * Message-integrity is not checked for server replies.
-* Allocation-heavy, uses Vec<u8> for byte buffers.
+* Allocation-heavy, uses `Vec<u8>` for byte buffers.
 
 Examples:
 
 * `echo.rs` - Connect to specified TURN server, authorize specified peer and act as an echo server for it (snippet depicted above)
+* `proxy.rs` - Exchange packets between a local UDP peer and TURN-mediated peer. Executes a script when allocation becomes available.

@@ -1,12 +1,9 @@
-#![allow(unused)]
-
 extern crate tokio;
 extern crate turnclient;
 
 
 use std::net::{SocketAddr};
 
-use tokio::net::udp::UdpSocket;
 use tokio::prelude::{Future,Stream};
 
 use turnclient::{ChannelUsage,MessageFromTurnServer,MessageToTurnServer};
@@ -14,7 +11,7 @@ use turnclient::{ChannelUsage,MessageFromTurnServer,MessageToTurnServer};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args : Vec<String> = std::env::args().collect();
     if args.len() != 5 {
-        eprintln!("Usage: proxy turn_host:port username password peer_host:port< interactive commands");
+        eprintln!("Usage: echo turn_host:port username password peer_host:port");
         Err(format!("Invalid command-line arguments"))?;
     }
 
