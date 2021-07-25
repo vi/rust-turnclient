@@ -23,7 +23,6 @@
 //! * Using short-term credentials instead of long-term.
 //! * "Don't fragment" specifier on sent datagrams
 //! * Even/odd port allocation
-//! * Error handling is ad-hoc `Box<dyn std::error::Error>`, with just a text strings.
 //! * Message-integrity is not checked for server replies.
 //! * Allocation-heavy, uses `Vec<u8>` for byte buffers.
 //! 
@@ -278,7 +277,7 @@ pub enum MessageToTurnServer {
     Disconnect,
 }
 
-type CompletionHook = Box<dyn FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error>>;
+type CompletionHook = Box<dyn FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error> + Send>;
 
 /// Unaccepted request being retried
 struct InflightRequest {
