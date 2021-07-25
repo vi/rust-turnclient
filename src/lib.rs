@@ -130,9 +130,11 @@ mod attrs {
 
 }
 
-/// Primitive error handling used in this library.
-/// File an issue if you don't like it.
-pub type Error = Box<dyn std::error::Error>;
+/// `anyhow`-based error handling.
+/// File an issue if you want proper `thiserror`-based errors.
+pub type Error = anyhow::Error;
+use anyhow::anyhow;
+use anyhow::bail;
 
 use tokio_udp::UdpSocket;
 
@@ -474,7 +476,7 @@ impl TurnClient {
         ));
 
         if p.channelized {
-            let chn = h.as_channel_number().ok_or("Channel number overflow")?;
+            let chn = h.as_channel_number().ok_or(anyhow!("Channel number overflow"))?;
             message.add_attribute(Attribute::ChannelNumber(
                 ChannelNumber::new(chn)?
             ));
@@ -516,7 +518,7 @@ impl TurnClient {
                         if len == l+4 {
                             return Poll::Ready(Ok(()))
                         } else {
-                            return Poll::Ready(Err("Invalid length of a sent UDP datagram".into()));
+                            return Poll::Ready(Err(anyhow!("Invalid length of a sent UDP datagram")));
                         }
                     }
                 }
@@ -545,7 +547,7 @@ impl TurnClient {
                 if len == bytes.len() {
                     return Poll::Ready(Ok(()))
                 } else {
-                    return Poll::Ready(Err("Invalid length of a sent UDP datagram".into()));
+                    return Poll::Ready(Err(anyhow!("Invalid length of a sent UDP datagram")));
                 }
             }
         }
@@ -597,13 +599,13 @@ impl TurnClient {
 
         let decoded = decoder
             .decode_from_bytes(buf)?
-            .map_err(|_| format!("Broken TURN reply"))?;
+            .map_err(|_| anyhow!("Broken TURN reply"))?;
 
         let tid = decoded.transaction_id();
 
         if decoded.class() == Indication {
-            let pa = decoded.get_attribute::<XorPeerAddress>().ok_or("No XorPeerAddress in data indication")?;
-            let data = decoded.get_attribute::<Data>().ok_or("No Data attribute in indication")?;
+            let pa = decoded.get_attribute::<XorPeerAddress>().ok_or(anyhow!("No XorPeerAddress in data indication"))?;
+            let data = decoded.get_attribute::<Data>().ok_or(anyhow!("No Data attribute in indication"))?;
 
             return Ok(MessageFromTurnServer::RecvFrom(
                 pa.address(),
@@ -626,10 +628,10 @@ impl TurnClient {
             // Not yet acquired an allocation
             match decoded.class() {
                 SuccessResponse => {
-                    let ra = decoded.get_attribute::<XorRelayAddress>().ok_or("No XorRelayAddress in reply")?;
-                    let ma = decoded.get_attribute::<XorMappedAddress>().ok_or("No XorMappedAddress in reply")?;
+                    let ra = decoded.get_attribute::<XorRelayAddress>().ok_or(anyhow!("No XorRelayAddress in reply"))?;
+                    let ma = decoded.get_attribute::<XorMappedAddress>().ok_or(anyhow!("No XorMappedAddress in reply"))?;
                     let sw = decoded.get_attribute::<Software>().as_ref().map(|x|x.description());
-                    let lt = decoded.get_attribute::<Lifetime>().ok_or("No Lifetime in reply")?;
+                    let lt = decoded.get_attribute::<Lifetime>().ok_or(anyhow!("No Lifetime in reply"))?;
 
                     let lt = self.process_alloc_lifetime(lt.lifetime());
 
@@ -647,18 +649,18 @@ impl TurnClient {
                 },
                 ErrorResponse => {
                     let ec = decoded.get_attribute::<ErrorCode>()
-                            .ok_or("ErrorResponse without ErrorCode?")?.code();
+                            .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?.code();
 
                     match ec {
                         401 => {
                             if self.nonce.is_some() {
-                                Err("Authentication failed")?;
+                                bail!("Authentication failed");
                             }
 
                             let re = decoded.get_attribute::<Realm>()
-                                    .ok_or("Missing Realm in NotAuthorized response")?;
+                                    .ok_or(anyhow!("Missing Realm in NotAuthorized response"))?;
                             let no = decoded.get_attribute::<Nonce>()
-                                    .ok_or("Missing Nonce in NotAuthorized response")?;
+                                    .ok_or(anyhow!("Missing Nonce in NotAuthorized response"))?;
                             
                             self.realm = Some(re.clone());
                             self.nonce = Some(no.clone());
@@ -667,19 +669,19 @@ impl TurnClient {
                         },
                         300 => {
                             let ta = decoded.get_attribute::<AlternateServer>()
-                                    .ok_or("Redirect without AlternateServer")?;
+                                    .ok_or(anyhow!("Redirect without AlternateServer"))?;
                             return Ok(RedirectedToAlternateServer(ta.address()));
                         },
                         _ => {
-                            Err(format!("Unknown error code from TURN: {}", ec))?;
+                            Err(anyhow!("Unknown error code from TURN: {}", ec))?;
                         }
                     }
                 },
                 Indication => {
-                    Err("Indication when not allocated anything")?
+                    bail!("Indication when not allocated anything")
                 },
                 Request => {
-                    Err("Received a Request instead of Response from server")?
+                    bail!("Received a Request instead of Response from server")
                 },
             }
         } else {
@@ -688,7 +690,7 @@ impl TurnClient {
                 SuccessResponse => {
                     match decoded.method() {    
                         REFRESH => {
-                            let lt = decoded.get_attribute::<Lifetime>().ok_or("No Lifetime in reply")?;
+                            let lt = decoded.get_attribute::<Lifetime>().ok_or(anyhow!("No Lifetime in reply"))?;
                             
                             if lt.lifetime() == Duration::from_secs(0) {
                                 self.when_to_renew_the_allocation = None;
@@ -702,24 +704,24 @@ impl TurnClient {
                                 Some(Box::pin(tokio_timer::sleep_until(Instant::now() + lt)));
                         },
                         CREATE_PERMISSION => {
-                            Err("Reached unreachable code: CREATE_PERMISSION should be handled elsewhere")?
+                            bail!("Reached unreachable code: CREATE_PERMISSION should be handled elsewhere")
                         },
                         x => {
-                            Err(format!("Not implemented: success response for {:?}", x))?
+                            bail!("Not implemented: success response for {:?}", x)
                         },
                     }
                 },
                 ErrorResponse => {
                     let ec = decoded.get_attribute::<ErrorCode>()
-                            .ok_or("ErrorResponse without ErrorCode?")?.code();
+                            .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?.code();
                     
-                    Err(format!("Error from TURN: {}", ec))?;
+                    bail!("Error from TURN: {}", ec);
                 },
                 Indication => {
-                    Err("Not implemented: handling indications")?
+                    bail!("Not implemented: handling indications");
                 },
                 Request => {
-                    Err("Received a Request instead of Response from server")?
+                    bail!("Received a Request instead of Response from server");
                 },
             }
             
@@ -785,7 +787,7 @@ impl Stream for TurnClient {
                                 rq.retryctr += 1;
                                 if rq.retryctr >= this.opts.max_retries {
                                     rq.status = InflightRequestStatus::TimedOut;
-                                    Err("Request timed out")?;
+                                    Err(anyhow!("Request timed out"))?;
                                 } else {
                                     rq.status = InflightRequestStatus::SendNow;
                                     continue 'main;
@@ -848,7 +850,7 @@ impl Sink<MessageToTurnServer> for TurnClient {
 
     fn start_send(mut self : Pin<&mut Self>, msg: MessageToTurnServer) -> Result<(),Error> {
         if self.shutdown {
-            return Err("TURN client received a shutdown request")?;
+            return Err(anyhow!("TURN client received a shutdown request"))?;
         }
         if self.buffered_input_message.is_some() {
             panic!("<TurnClient as Stream>::start_send called without prior poll_ready");
@@ -874,7 +876,7 @@ impl Sink<MessageToTurnServer> for TurnClient {
 
                 if chusage == ChannelUsage::WithChannel {
                     if this.permissions.len() >= 0x3FFE {
-                        Err("There are too many permissions/channels to open another channel")?
+                        Err(anyhow!("There are too many permissions/channels to open another channel"))?
                     }
                 }
 
