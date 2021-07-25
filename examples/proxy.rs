@@ -6,17 +6,20 @@ extern crate either;
 
 use std::net::{SocketAddr};
 
-use tokio::net::udp::{UdpSocket,UdpFramed};
-use tokio::prelude::{Future,Stream,Sink};
+use tokio::net::{UdpSocket};
+use tokio_util::udp::UdpFramed;
 
 use futuristic::SinkTools;
 use either::Either;
 
+use futures::StreamExt;
+use futures::SinkExt;
+
 use turnclient::{ChannelUsage,MessageFromTurnServer,MessageToTurnServer};
 
 enum FromForwardOrFromTurn {
-    FromTurn(MessageFromTurnServer),
-    FromForward(Vec<u8>),
+    FromTurn(Result<MessageFromTurnServer,turnclient::Error>),
+    FromForward(Result<Vec<u8>, turnclient::Error>),
 }
 
 enum ToForwardOrToTurn {
@@ -24,7 +27,9 @@ enum ToForwardOrToTurn {
     ToForward(Vec<u8>),
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+#[tokio::main(flavor="current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args : Vec<String> = std::env::args().collect();
     if args.len() != 7 {
         eprintln!("Usage: proxy turn_host:port username password peer_host:port script_to_run_when_allocation_is_ready forward_ip:port");
@@ -41,23 +46,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let forward_addr: SocketAddr = args[6].parse()?;
 
     let local_addr : SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let udp = UdpSocket::bind(&local_addr)?; // for TURN
-    let udp2 = UdpSocket::bind(&local_addr)?; // for forward_addr
+    let udp = UdpSocket::bind(&local_addr).await?; // for TURN
+    let udp2 = UdpSocket::bind(&local_addr).await?; // for forward_addr
 
     let c = turnclient::TurnClientBuilder::new(turn_server, username, password);
     let (turnsink, turnstream) = c.build_and_send_request(udp).split();
 
-    let udpf = UdpFramed::new(udp2, tokio::codec::BytesCodec::new());
+    let udpf = UdpFramed::new(udp2, tokio_util::codec::BytesCodec::new());
 
     let (forwsink, forwstream) = udpf.split();
 
-    let str1 = forwstream.map(|(buf,_addr)| {
-        FromForwardOrFromTurn::FromForward(buf[..].to_vec())
-    }).map_err(|e|e.into());
+    let str1 = forwstream.map(|x| {
+        match x {
+            Ok((buf,_addr)) => FromForwardOrFromTurn::FromForward(Ok(buf[..].to_vec())),
+            Err(e) => FromForwardOrFromTurn::FromForward(Err(e.into())),
+        }
+    });
     let str2 = turnstream.map(|x| {
         FromForwardOrFromTurn::FromTurn(x)
     });
-    let str_ = str1.select(str2);
+    let str_ = futures::stream::select(str1,str2);
 
     let sin = turnsink.fork(forwsink.sink_map_err(|e|e.into()),move |x| {
         match x {
@@ -72,8 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use MessageToTurnServer::*;
 
     let f = str_.map(move |x| {
-            match x {
-                FromTurn(AllocationGranted{relay_address,..}) => {
+            Ok(match x {
+                FromTurn(Ok(AllocationGranted{relay_address,..})) => {
                     //eprintln!("{:?}", relay_address);
                     let ra = match relay_address {
                         SocketAddr::V4(x) => format!("{}", x),
@@ -82,23 +90,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = std::process::Command::new(script.clone()).arg(ra).status();
                     ToTurn(AddPermission(peer_addr, ChannelUsage::WithChannel))
                 },
-                FromTurn(RecvFrom(_sa,data)) => {
+                FromTurn(Ok(RecvFrom(_sa,data))) => {
                     //eprintln!(">");
                     ToForward(data)
                 },
-                FromForward(data) => {
+                FromForward(Ok(data)) => {
                     //eprintln!("<");
                     ToTurn(SendTo(peer_addr, data))
                 }
+                FromTurn(Err(e)) | FromForward(Err(e)) => {
+                    eprintln!("{}", e);
+                    ToTurn(MessageToTurnServer::Noop)
+                }
                 _ => ToTurn(MessageToTurnServer::Noop),
-            }
-        }).forward(sin)
-        .and_then(|(_,_)|{
-            futures::future::ok(())
-        })
-        .map_err(|e|eprintln!("{}", e));
+            })
+        }).forward(sin);
 
-    tokio::runtime::current_thread::run(f);
+    if let Err(e) = f.await {
+        eprintln!("{}", e);
+    }
 
     Ok(())
 }

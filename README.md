@@ -2,14 +2,14 @@ Simple Rust TURN (RFC 5766) client for UDP - traverse even strict NAT; async onl
 
 `<bonus>` A general-purpose TURN client/proxy, allowing to use TURN for custom things (you provide the scripts for signaling). There is a pre-built executable at Github releases.`</bonus>`.
 
-Cleaned-up example snippet:
+Cleaned-up echo example snippet:
 
 ```rust
-let udp : tokio::net::udp::UdpSocket; 
+let udp : tokio::net::UdpSocket; 
 let c = turnclient::TurnClientBuilder::new(turn_server, username, password);
 let (turnsink, turnstream) = c.build_and_send_request(udp).split();
 turnstream.map(move |event| {
-    match event {
+    Ok(match event {
         MessageFromTurnServer::AllocationGranted{ relay_address, ..} => {
             MessageToTurnServer::AddPermission(peer_addr, ChannelUsage::WithChannel)
         },
@@ -17,8 +17,8 @@ turnstream.map(move |event| {
             MessageToTurnServer::SendTo(sa, data)
         },
         _ => MessageToTurnServer::Noop,
-    }
-}).forward(turnsink); // run this with Tokio
+    })
+}).forward(turnsink).await;
 ```
 
 See crate-level docs for further instructions.
@@ -39,3 +39,7 @@ Examples:
 
 * `echo.rs` - Connect to specified TURN server, authorize specified peer and act as an echo server for it (snippet depicted above)
 * `proxy.rs` - Exchange packets between a local UDP peer and TURN-mediated peer. Executes a script when allocation becomes available.
+
+---
+
+There is old `0.1.0` version of the crate for old Rust and Tokio `0.1`. This may perform better or worse than current version, I haven't really checked yet.

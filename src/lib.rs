@@ -36,13 +36,16 @@ const PERM_REFRESH_INTERVAL : u64 = 180;
 extern crate bytecodec;
 #[macro_use]
 extern crate stun_codec;
-#[macro_use]
+#[macro_use] // for stun_codec's define_attribute_enums macro
 extern crate trackable;
 extern crate rand;
 
 extern crate futures;
-extern crate tokio_udp;
-extern crate tokio_timer;
+extern crate tokio;
+use tokio::net as tokio_udp;
+use tokio::time as tokio_timer;
+
+use std::pin::Pin;
 
 extern crate fnv;
 
@@ -81,10 +84,11 @@ use stun_codec::rfc5766::methods::{
     SEND,
 };
 use stun_codec::{Message, MessageClass, TransactionId};
-use std::time::{Instant,Duration};
+use std::time::{Duration};
+use tokio::time::Instant;
 use self::attrs::Attribute;
 
-use futures::{Stream, Sink, Future, Poll, Async, StartSend, AsyncSink};
+use futures::{Stream, Sink, Future, task::Poll, task::Context};
 
 use fnv::FnvHashMap as HashMap;
 
@@ -132,7 +136,7 @@ pub type Error = Box<dyn std::error::Error>;
 
 use tokio_udp::UdpSocket;
 
-use tokio_timer::{Interval,Delay};
+use tokio_timer::{Interval,Sleep as Delay};
 
 use slab_typesafe::Slab;
 
@@ -192,6 +196,8 @@ impl TurnClientBuilder {
 
             permissions_pinger: None,
             shutdown: false,
+
+            buffered_input_message: None,
         };
         tc.send_allocate_request(false).unwrap();
         tc
@@ -239,13 +245,13 @@ pub enum MessageFromTurnServer {
 
 enum InflightRequestStatus {
     SendNow,
-    RetryLater(Delay),
+    RetryLater(Pin<Box<Delay>>),
     TimedOut,
 }
 
 /// Whether to just create permission of also allocate a channel for it.
 /// I don't see much reasons not to allocate a channel.
-#[derive(Debug,PartialEq,Eq,Ord,PartialOrd,Hash)]
+#[derive(Debug,PartialEq,Eq,Ord,PartialOrd,Hash,Clone,Copy)]
 pub enum ChannelUsage {
     /// Create a channel, resulting in shorter datagrams between you and TURN for this peer.
     WithChannel,
@@ -270,7 +276,7 @@ pub enum MessageToTurnServer {
     Disconnect,
 }
 
-type CompletionHook = Box<FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error>>;
+type CompletionHook = Box<dyn FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error>>;
 
 /// Unaccepted request being retried
 struct InflightRequest {
@@ -316,7 +322,7 @@ pub struct TurnClient {
     inflight: HashMap<TransactionId, InflightRequest>,
 
     /// None means not yet allocated
-    when_to_renew_the_allocation: Option<Delay>,
+    when_to_renew_the_allocation: Option<Pin<Box<Delay>>>,
 
     realm: Option<Realm>,
     nonce: Option<Nonce>,
@@ -326,6 +332,8 @@ pub struct TurnClient {
 
     permissions_pinger: Option<Interval>,
     shutdown: bool,
+
+    buffered_input_message: Option<MessageToTurnServer>,
 }
 
 /// Simple TURN client in form of `Stream<Item=MessageFromTurnServer>` and `Sink<SinkItem=MessageToTurnServer>`.
@@ -489,8 +497,8 @@ impl TurnClient {
         Ok(())
     }
     
-    fn send_data_indication(&mut self, sa: SocketAddr, data: Vec<u8>) -> Result<(),Error> {
-        
+    /// Send data to the socket where it is known in advance that a datagram would surely be accepted, not `Poll::Pending`
+    fn send_data_indication(&mut self, cx: &mut Context, sa: SocketAddr, data: &[u8]) -> Poll<Result<(),Error>> {
         if let Some(p) = self.sockaddr2perm.get(&sa) {
             if let Some(cn) = p.as_channel_number() {
                 let mut b = Vec::with_capacity(data.len() + 4);
@@ -501,14 +509,17 @@ impl TurnClient {
                 b.push( ((l  & 0x00FF) >> 0) as u8);
                 b.extend_from_slice(&data[..]);
 
-                match self.udp.poll_send_to(&b[..], &self.opts.turn_server) {
-                    Err(e)=>Err(e)?,
-                    Ok(Async::NotReady) => Err("UDP socket became not write-ready after reporting readiness")?,
-                    Ok(Async::Ready(len)) => {
-                        assert_eq!(len, l+4)
+                match self.udp.poll_send_to(cx,&b[..], self.opts.turn_server) {
+                    Poll::Ready(Err(e))=>return Poll::Ready(Err(e.into())),
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(len)) => {
+                        if len == l+4 {
+                            return Poll::Ready(Ok(()))
+                        } else {
+                            return Poll::Ready(Err("Invalid length of a sent UDP datagram".into()));
+                        }
                     }
                 }
-                return Ok(())
             }
         }
 
@@ -521,21 +532,23 @@ impl TurnClient {
             XorPeerAddress::new(sa)
         ));
         message.add_attribute(Attribute::Data(
-            Data::new(data)?
+            Data::new(data.to_vec())?
         ));
         
         let mut encoder = MessageEncoder::new();
         let bytes = encoder.encode_into_bytes(message)?;
 
-        match self.udp.poll_send_to(&bytes[..], &self.opts.turn_server) {
-            Err(e)=>Err(e)?,
-            Ok(Async::NotReady) => Err("UDP socket became not write-ready after reporting readiness")?,
-            Ok(Async::Ready(len)) => {
-                assert_eq!(len, bytes.len())
+        match self.udp.poll_send_to(cx, &bytes[..], self.opts.turn_server) {
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)?),
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(len)) => {
+                if len == bytes.len() {
+                    return Poll::Ready(Ok(()))
+                } else {
+                    return Poll::Ready(Err("Invalid length of a sent UDP datagram".into()));
+                }
             }
         }
-        
-        Ok(())
     }
 
     /// Handle incoming packet from TURN server
@@ -622,7 +635,7 @@ impl TurnClient {
 
                     /* Big state change */
                     self.when_to_renew_the_allocation = 
-                        Some(Delay::new(Instant::now() + lt));
+                        Some(Box::pin(tokio::time::sleep_until(tokio::time::Instant::now() + lt)));
                     /* Big state echange */
 
                     let ret = AllocationGranted {
@@ -686,7 +699,7 @@ impl TurnClient {
                             let lt = self.process_alloc_lifetime(lt.lifetime());
 
                             self.when_to_renew_the_allocation = 
-                                Some(Delay::new(Instant::now() + lt));
+                                Some(Box::pin(tokio_timer::sleep_until(Instant::now() + lt)));
                         },
                         CREATE_PERMISSION => {
                             Err("Reached unreachable code: CREATE_PERMISSION should be handled elsewhere")?
@@ -717,28 +730,29 @@ impl TurnClient {
 }
 
 impl Stream for TurnClient {
-    type Error = Error;
-    type Item = MessageFromTurnServer;
+    type Item = Result<MessageFromTurnServer, Error>;
 
-    fn poll(&mut self) -> Poll<Option<MessageFromTurnServer>, Error> {
+    fn poll_next(self: Pin<&mut TurnClient>, cx: &mut Context) -> Poll<Option<Result<MessageFromTurnServer,Error>>> {
+        let this : &mut TurnClient = Pin::into_inner(self);
         'main: loop {
-            if self.shutdown {
-                return Ok(Async::Ready(None));
+            if this.shutdown {
+                return Poll::Ready(None);
             }
 
             let mut buf = [0; 1560];
+            let mut buf = tokio::io::ReadBuf::new(&mut buf[..]);
             // TURN client's jobs (running in parallel):
             // 1. Handle incoming packets
-            match self.udp.poll_recv_from(&mut buf[..]) {
-                Err(e) => Err(e)?,
-                Ok(Async::NotReady) => (),
-                Ok(Async::Ready((len, addr))) => {
-                    let buf = &buf[0..len];
-                    if addr != self.opts.turn_server {
-                        return Ok(Async::Ready(Some(MessageFromTurnServer::ForeignPacket(addr,buf.to_vec()))));
+            match this.udp.poll_recv_from(cx,&mut buf) {
+                Poll::Pending => (),
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(Ok(addr)) => {
+                    let buf = buf.filled();
+                    if addr != this.opts.turn_server {
+                        return Poll::Ready(Some(Ok(MessageFromTurnServer::ForeignPacket(addr,buf.to_vec()))));
                     }
-                    let ret = self.handle_incoming_packet(buf)?;
-                    return Ok(Async::Ready(Some(ret)));
+                    let ret = this.handle_incoming_packet(buf)?;
+                    return Poll::Ready(Some(Ok(ret)));
                 },
             }
 
@@ -746,32 +760,30 @@ impl Stream for TurnClient {
             // (includes initial send of any request)
             // TODO: refactor this quadratical complexity
             let mut remove_this_stale_rqs = vec![];
-            for (k, rq) in &mut self.inflight {
+            for (k, rq) in &mut this.inflight {
                 match &mut rq.status {
                     InflightRequestStatus::TimedOut => {
                         remove_this_stale_rqs.push(*k);
                     },
                     InflightRequestStatus::SendNow => {
-                        match self.udp.poll_send_to(&rq.data[..], &self.opts.turn_server) {
-                            Err(e)=>Err(e)?,
-                            Ok(Async::NotReady)=>(),
-                            Ok(Async::Ready(len)) => {
+                        match this.udp.poll_send_to(cx, &rq.data[..], this.opts.turn_server) {
+                            Poll::Ready(Err(e))=>Err(e)?,
+                            Poll::Pending=>(),
+                            Poll::Ready(Ok(len)) => {
                                 assert_eq!(len, rq.data.len());
-                                let d = Delay::new(Instant::now() + self.opts.retry_interval);
-                                //let _ = d.poll(); // register it now, don't rely on implicits
-                                rq.status = InflightRequestStatus::RetryLater(d);
+                                let d = tokio_timer::sleep_until(Instant::now() + this.opts.retry_interval);
+                                rq.status = InflightRequestStatus::RetryLater(Box::pin(d));
 
                                 continue 'main;
                             },
                         }
                     },
                     InflightRequestStatus::RetryLater(ref mut d) => {
-                        match d.poll() {
-                            Err(e)=>Err(e)?,
-                            Ok(Async::NotReady)=>(),
-                            Ok(Async::Ready(())) => {
+                        match d.as_mut().poll(cx) {
+                            Poll::Pending=>(),
+                            Poll::Ready(()) => {
                                 rq.retryctr += 1;
-                                if rq.retryctr >= self.opts.max_retries {
+                                if rq.retryctr >= this.opts.max_retries {
                                     rq.status = InflightRequestStatus::TimedOut;
                                     Err("Request timed out")?;
                                 } else {
@@ -784,19 +796,18 @@ impl Stream for TurnClient {
                 }
             }
             for rm in remove_this_stale_rqs {
-                self.inflight.remove(&rm);
+                this.inflight.remove(&rm);
             }
 
             // 3. Refresh the allocation periodically
 
-            if let Some(x) = &mut self.when_to_renew_the_allocation {
-                match x.poll() {
-                    Err(e)=>Err(e)?,
-                    Ok(Async::NotReady) => (),
-                    Ok(Async::Ready(())) => {
-                        let ri = self.opts.refresh_interval;
-                        x.reset(Instant::now() + ri);
-                        self.send_allocate_request(false)?;
+            if let Some(x) = &mut this.when_to_renew_the_allocation {
+                match x.as_mut().poll(cx) {
+                    Poll::Pending => (),
+                    Poll::Ready(()) => {
+                        let ri = this.opts.refresh_interval;
+                        x.as_mut().reset(Instant::now() + ri);
+                        this.send_allocate_request(false)?;
                         continue 'main;
                     },
                 }
@@ -804,12 +815,11 @@ impl Stream for TurnClient {
 
             // 4. Refresh channels and permissions periodically
             let mut ids_to_refresh = vec![];
-            if let Some(pp) = &mut self.permissions_pinger {
-                match pp.poll() {
-                    Err(e)=>Err(e)?,
-                    Ok(Async::NotReady) => (),
-                    Ok(Async::Ready(_instant)) => {
-                        for (h, _) in self.permissions.iter() {
+            if let Some(pp) = &mut this.permissions_pinger {
+                match pp.poll_tick(cx) {
+                    Poll::Pending => (),
+                    Poll::Ready(_instant) => {
+                        for (h, _) in this.permissions.iter() {
                             ids_to_refresh.push(h);
                         }
                     },
@@ -818,35 +828,52 @@ impl Stream for TurnClient {
             if !ids_to_refresh.is_empty() {
                 for h in ids_to_refresh {
                     // TODO: send multiple addresses per request, not one by one
-                    self.send_perm_request(h)?;
+                    this.send_perm_request(h)?;
                 }
                 continue 'main;
             }
             
 
-            return Ok(Async::NotReady) // don't care which one in particular is not ready
+            return Poll::Pending // don't care which one in particular is not ready
         } // loop
     }
 }
 
-impl Sink for TurnClient {
-    type SinkItem = MessageToTurnServer;
-    type SinkError = Error;
+impl Sink<MessageToTurnServer> for TurnClient {
+    type Error = Error;
 
-    fn start_send(&mut self, msg: MessageToTurnServer) -> StartSend<MessageToTurnServer,Error> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_flush(cx)
+    }
+
+    fn start_send(mut self : Pin<&mut Self>, msg: MessageToTurnServer) -> Result<(),Error> {
         if self.shutdown {
-            return Ok(AsyncSink::Ready);
+            return Err("TURN client received a shutdown request")?;
         }
+        if self.buffered_input_message.is_some() {
+            panic!("<TurnClient as Stream>::start_send called without prior poll_ready");
+        }
+        self.buffered_input_message = Some(msg);
+
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this : &mut TurnClient = Pin::into_inner(self);
+        let msg = match this.buffered_input_message.take() {
+            Some(x) => x,
+            None => return Poll::Ready(Ok(()))
+        };
         use self::MessageToTurnServer::*;
         match msg {
             Noop => (),
             AddPermission(sa, chusage) => {
-                if self.permissions_pinger.is_none() {
-                    self.permissions_pinger = Some(Interval::new_interval(Duration::from_secs(PERM_REFRESH_INTERVAL)));
+                if this.permissions_pinger.is_none() {
+                    this.permissions_pinger = Some(tokio_timer::interval(Duration::from_secs(PERM_REFRESH_INTERVAL)));
                 }
 
                 if chusage == ChannelUsage::WithChannel {
-                    if self.permissions.len() >= 0x3FFE {
+                    if this.permissions.len() >= 0x3FFE {
                         Err("There are too many permissions/channels to open another channel")?
                     }
                 }
@@ -856,32 +883,31 @@ impl Sink for TurnClient {
                     channelized: chusage == ChannelUsage::WithChannel,
                     creation_already_reported: false,
                 };
-                let id = self.permissions.insert(p);
-                self.sockaddr2perm.insert(sa, id);
-                self.send_perm_request(id)?;
+                let id = this.permissions.insert(p);
+                this.sockaddr2perm.insert(sa, id);
+                this.send_perm_request(id)?;
             },
-            SendTo(sa, data) => {
-                match self.udp.poll_write_ready() {
-                    Err(e)=>Err(e)?,
-                    Ok(Async::Ready(_))=>(),
-                    Ok(Async::NotReady) => {
-                        return Ok(AsyncSink::NotReady(SendTo(sa,data)));
+            SendTo(sa, ref data) => {
+                match this.send_data_indication(cx, sa, &data[..]) {
+                    Poll::Ready(Ok(())) => (),
+                    Poll::Ready(Err(e)) => {
+                        this.buffered_input_message = Some(msg);
+                        return Poll::Ready(Err(e))
                     },
+                    Poll::Pending => return Poll::Pending,
                 }
-                self.send_data_indication(sa, data)?;
             },
             Disconnect => {
-                self.send_allocate_request(true)?;
+                this.send_allocate_request(true)?;
             },
         }
-        Ok(AsyncSink::Ready)
+        return Poll::Ready(Ok(()))
     }
 
-    fn poll_complete(&mut self) -> Poll<(),Error> {
-        // I always initially unsure about how to divide work
-        // between start_send and poll_complete
-        Ok(Async::Ready(()))
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_flush(cx)
     }
+    
 }
 
 #[cfg(test)]
