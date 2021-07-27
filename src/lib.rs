@@ -833,7 +833,6 @@ impl Stream for TurnClient {
                 }
                 continue 'main;
             }
-            
 
             return Poll::Pending // don't care which one in particular is not ready
         } // loop
@@ -861,48 +860,81 @@ impl Sink<MessageToTurnServer> for TurnClient {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this : &mut TurnClient = Pin::into_inner(self);
-        let msg = match this.buffered_input_message.take() {
-            Some(x) => x,
-            None => return Poll::Ready(Ok(()))
-        };
-        use self::MessageToTurnServer::*;
-        match msg {
-            Noop => (),
-            AddPermission(sa, chusage) => {
-                if this.permissions_pinger.is_none() {
-                    this.permissions_pinger = Some(tokio_timer::interval(Duration::from_secs(PERM_REFRESH_INTERVAL)));
-                }
-
-                if chusage == ChannelUsage::WithChannel {
-                    if this.permissions.len() >= 0x3FFE {
-                        Err(anyhow!("There are too many permissions/channels to open another channel"))?
-                    }
-                }
-
-                let p = Permission {
-                    addr: sa,
-                    channelized: chusage == ChannelUsage::WithChannel,
-                    creation_already_reported: false,
-                };
-                let id = this.permissions.insert(p);
-                this.sockaddr2perm.insert(sa, id);
-                this.send_perm_request(id)?;
-            },
-            SendTo(sa, ref data) => {
-                match this.send_data_indication(cx, sa, &data[..]) {
-                    Poll::Ready(Ok(())) => (),
-                    Poll::Ready(Err(e)) => {
-                        this.buffered_input_message = Some(msg);
-                        return Poll::Ready(Err(e))
+        'main: loop {  
+            // Parial sending logic for immediate sending (excluding the delay and timeout handling)
+           
+            // XXX quadratical complexity on number of in-flight requests
+            'requests: for (_, rq) in &mut this.inflight {
+                match &mut rq.status {
+                    InflightRequestStatus::TimedOut => {
+                        // handled in Stream::poll_next
                     },
-                    Poll::Pending => return Poll::Pending,
+                    InflightRequestStatus::SendNow => {
+                        match this.udp.poll_send_to(cx, &rq.data[..], this.opts.turn_server) {
+                            Poll::Ready(Err(e))=>Err(e)?,
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Ok(len)) => {
+                                // TODO: deduplicate this fragment
+                                assert_eq!(len, rq.data.len());
+                                let d = tokio_timer::sleep_until(Instant::now() + this.opts.retry_interval);
+                                rq.status = InflightRequestStatus::RetryLater(Box::pin(d));
+
+                                continue 'requests;
+                            },
+                        }
+                    },
+                    InflightRequestStatus::RetryLater(ref mut _d) => {
+                        // handled in Stream::poll_next
+                    },
                 }
-            },
-            Disconnect => {
-                this.send_allocate_request(true)?;
-            },
+            }
+
+            // secondly. process the incoming message
+            let msg = match this.buffered_input_message.take() {
+                Some(x) => x,
+                None => return Poll::Ready(Ok(()))
+            };
+            use self::MessageToTurnServer::*;
+            match msg {
+                Noop => (),
+                AddPermission(sa, chusage) => {
+                    if this.permissions_pinger.is_none() {
+                        this.permissions_pinger = Some(tokio_timer::interval(Duration::from_secs(PERM_REFRESH_INTERVAL)));
+                    }
+    
+                    if chusage == ChannelUsage::WithChannel {
+                        if this.permissions.len() >= 0x3FFE {
+                            Err(anyhow!("There are too many permissions/channels to open another channel"))?
+                        }
+                    }
+    
+                    let p = Permission {
+                        addr: sa,
+                        channelized: chusage == ChannelUsage::WithChannel,
+                        creation_already_reported: false,
+                    };
+                    let id = this.permissions.insert(p);
+                    this.sockaddr2perm.insert(sa, id);
+                    this.send_perm_request(id)?;
+                    continue 'main;
+                },
+                SendTo(sa, ref data) => {
+                    match this.send_data_indication(cx, sa, &data[..]) {
+                        Poll::Ready(Ok(())) => (),
+                        Poll::Ready(Err(e)) => {
+                            this.buffered_input_message = Some(msg);
+                            return Poll::Ready(Err(e))
+                        },
+                        Poll::Pending => return Poll::Pending,
+                    }
+                },
+                Disconnect => {
+                    this.send_allocate_request(true)?;
+                    continue 'main;
+                },
+            }
+            return Poll::Ready(Ok(()))
         }
-        return Poll::Ready(Ok(()))
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
