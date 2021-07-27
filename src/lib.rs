@@ -295,7 +295,11 @@ struct InflightRequest {
 
 declare_slab_token!(PermissionHandle);
 
-impl PermissionHandle {
+// if high bit is set then it is a non-channelized permission
+#[derive(Clone,Copy)]
+struct PermissionToken(u32);
+
+impl PermissionToken {
     pub fn as_channel_number(&self) -> Option<u16> {
         if self.0 <= 0x3FFE {
             Some(0x4000 + (self.0 as u16))
@@ -306,10 +310,23 @@ impl PermissionHandle {
 
     pub fn from_channel_number(n: u16) -> Option<Self> {
         if n >= 0x4000 && n <= 0x7FFE {
-            Some(((n as usize) - 0x4000).into())
+            Some(PermissionToken((n as u32) - 0x4000).into())
         } else {
             None
         }
+    }
+
+    pub fn as_handle(&self) -> PermissionHandle {
+        PermissionHandle((self.0 & 0x7FFF_FFFF) as usize)
+    }
+
+    pub fn from_handle(ph: PermissionHandle, channelized: bool) -> PermissionToken {
+        assert!(ph.0 < 0x80000000);
+        let mut x = ph.0 as u32;
+        if !channelized {
+            x |= 0x8000_0000;
+        }
+        PermissionToken(x)
     }
 }
 
@@ -335,7 +352,7 @@ pub struct TurnClient {
     nonce: Option<Nonce>,
 
     permissions: Slab<PermissionHandle, Permission>,
-    sockaddr2perm: HashMap<SocketAddr, PermissionHandle>,
+    sockaddr2perm: HashMap<SocketAddr, PermissionToken>,
 
     permissions_pinger: Option<Interval>,
     shutdown: bool,
@@ -481,7 +498,7 @@ impl TurnClient {
         ));
 
         if p.channelized {
-            let chn = h.as_channel_number().ok_or(anyhow!("Channel number overflow"))?;
+            let chn = PermissionToken::from_handle( h,true).as_channel_number().ok_or(anyhow!("Channel number overflow"))?;
             message.add_attribute(Attribute::ChannelNumber(
                 ChannelNumber::new(chn)?
             ));
@@ -539,6 +556,8 @@ impl TurnClient {
                         }
                     }
                 }
+                #[allow(unreachable_code)]
+                { unreachable!() }
             }
         }
 
@@ -585,12 +604,12 @@ impl TurnClient {
                 let chnum = (buf[0] as u16)<<8  |  (buf[1] as u16);
                 let len = (buf[2] as u16) << 8 | (buf[3] as u16);
 
-                let h = PermissionHandle::from_channel_number(chnum);
+                let h = PermissionToken::from_channel_number(chnum);
 
                 if h.is_none() || buf.len() < (len as usize)+4 {
                     foreign_packet = true;
                 } else {
-                    if let Some(p) = self.permissions.get(h.unwrap()) {
+                    if let Some(p) = self.permissions.get(h.unwrap().as_handle()) {
                         return Ok(MessageFromTurnServer::RecvFrom(
                             p.addr,
                             buf[4..].to_vec(),
@@ -926,8 +945,10 @@ impl Sink<MessageToTurnServer> for TurnClient {
                     if this.permissions_pinger.is_none() {
                         this.permissions_pinger = Some(tokio_timer::interval(Duration::from_secs(PERM_REFRESH_INTERVAL)));
                     }
+
+                    let channelized = chusage == ChannelUsage::WithChannel;
     
-                    if chusage == ChannelUsage::WithChannel {
+                    if channelized {
                         if this.permissions.len() >= 0x3FFE {
                             Err(anyhow!("There are too many permissions/channels to open another channel"))?
                         }
@@ -935,11 +956,11 @@ impl Sink<MessageToTurnServer> for TurnClient {
     
                     let p = Permission {
                         addr: sa,
-                        channelized: chusage == ChannelUsage::WithChannel,
+                        channelized,
                         creation_already_reported: false,
                     };
                     let id = this.permissions.insert(p);
-                    this.sockaddr2perm.insert(sa, id);
+                    this.sockaddr2perm.insert(sa, PermissionToken::from_handle(id, channelized));
                     this.send_perm_request(id)?;
                     continue 'main;
                 },
