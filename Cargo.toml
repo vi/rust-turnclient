@@ -1,6 +1,6 @@
 [package]
 name = "turnclient"
-version = "0.3.1"
+version = "0.3.2"
 authors = ["Vitaly _Vi Shukela <vi0oss@gmail.com>"]
 edition = "2018"
 description = "Simple TURN client for UDP - traverse even strict NAT; async only"
