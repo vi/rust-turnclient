@@ -227,6 +227,9 @@ pub enum MessageFromTurnServer {
     /// Permission that you have requested by writing to sink has been successfully created.
     PermissionCreated(SocketAddr),
 
+    /// TURN server defined creating a permission or channel
+    PermissionNotCreated(SocketAddr),
+
     /// Incoming datagram from peer, regardless whether it comes from ChannelData or Indication.
     RecvFrom(SocketAddr, Vec<u8>),
 
@@ -277,14 +280,17 @@ pub enum MessageToTurnServer {
     Disconnect,
 }
 
-type CompletionHook = Box<dyn FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error> + Send>;
+struct CompletionHooks {
+    success: Box<dyn FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error> + Send>,
+    failure: Box<dyn FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error> + Send>,
+}
 
 /// Unaccepted request being retried
 struct InflightRequest {
     status: InflightRequestStatus,
     data: Vec<u8>,
     retryctr: usize,
-    completion_hook: Option<CompletionHook>,
+    completion_hook: Option<CompletionHooks>,
 }
 
 declare_slab_token!(PermissionHandle);
@@ -431,7 +437,7 @@ impl TurnClient {
                 &mut self, 
                 transid: TransactionId,
                 message: Message<Attribute>,
-                completion_hook: Option<CompletionHook>,
+                completion_hook: Option<CompletionHooks>,
     ) -> Result<(),Error> {
         if self.shutdown {
             return Ok(())
@@ -481,19 +487,31 @@ impl TurnClient {
             ));
         }
 
-        let hook : CompletionHook = Box::new(move |_self|{
-            let p = &mut _self.permissions[h];
-            let msg = if p.creation_already_reported {
-                MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled
-            } else {
-                p.creation_already_reported = true;
-                MessageFromTurnServer::PermissionCreated(p.addr)
-            };
-            Ok(Some(msg))
-        });
+        let hooks = CompletionHooks { 
+            success : Box::new(move |_self|{
+                let p = &mut _self.permissions[h];
+                let msg = if p.creation_already_reported {
+                    MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled
+                } else {
+                    p.creation_already_reported = true;
+                    MessageFromTurnServer::PermissionCreated(p.addr)
+                };
+                Ok(Some(msg))
+            }),
+            failure : Box::new(move |_self|{
+                let p = &mut _self.permissions[h];
+                let msg = if p.creation_already_reported {
+                    MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled
+                } else {
+                    p.creation_already_reported = true;
+                    MessageFromTurnServer::PermissionNotCreated(p.addr)
+                };
+                Ok(Some(msg))
+            }),
+        };
 
         self.sign_request(&mut message)?;
-        self.file_request(transid, message, Some(hook))?;
+        self.file_request(transid, message, Some(hooks))?;
     
         Ok(())
     }
@@ -617,8 +635,15 @@ impl TurnClient {
         } else {
             let rm = self.inflight.remove(&tid);
             if let Some(mut h) = rm.unwrap().completion_hook {
-                if let Some(ret) = (*h)(self)? {
-                    return Ok(ret);
+                match decoded.class() {
+                    Request => bail!("Server replied to our request with another request?"),
+                    Indication => bail!("Server replied to our request with an indication?"),
+                    SuccessResponse => if let Some(ret) = (*h.success)(self)? {
+                        return Ok(ret);
+                    },
+                    ErrorResponse => if let Some(ret) = (*h.failure)(self)? {
+                        return Ok(ret);
+                    },
                 }
             }
         }
