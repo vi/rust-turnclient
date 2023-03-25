@@ -6,7 +6,11 @@ extern crate either;
 
 use std::net::{SocketAddr};
 
+use bytes::Bytes;
+use futures::stream::SplitSink;
+use futures::stream::SplitStream;
 use tokio::net::{UdpSocket};
+use tokio_util::codec::BytesCodec;
 use tokio_util::udp::UdpFramed;
 
 use futuristic::SinkTools;
@@ -55,6 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udpf = UdpFramed::new(udp2, tokio_util::codec::BytesCodec::new());
 
     let (forwsink, forwstream) = udpf.split();
+    let forwsink : SplitSink<UdpFramed<BytesCodec>,(Bytes,SocketAddr)> = forwsink;
+    let forwstream: SplitStream<UdpFramed<BytesCodec>> = forwstream;
 
     let str1 = forwstream.map(|x| {
         match x {
