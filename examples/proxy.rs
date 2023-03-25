@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let str_ = futures::stream::select(str1,str2);
 
-    let sin = turnsink.fork(forwsink.sink_map_err(|e|e.into()),move |x| {
+    let sin = turnsink.fork(forwsink.sink_map_err(|e:std::io::Error|e.into()),move |x| {
         match x {
             ToForwardOrToTurn::ToTurn(x) => Either::Left(x),
             ToForwardOrToTurn::ToForward(x) => Either::Right((x.into(), forward_addr)),
