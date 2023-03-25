@@ -2,7 +2,7 @@ extern crate tokio;
 extern crate turnclient;
 
 
-use std::net::{SocketAddr};
+use std::{net::{SocketAddr}, time::Duration};
 
 use futures::{StreamExt};
 
@@ -24,7 +24,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local_addr : SocketAddr = "0.0.0.0:0".parse().unwrap();
     let udp = tokio::net::UdpSocket::bind(&local_addr).await?;
 
-    let c = turnclient::TurnClientBuilder::new(turn_server, username, password);
+    let mut c = turnclient::TurnClientBuilder::new(turn_server, username, password);
+    //c.refresh_interval = Duration::from_secs(5);
+    c.enable_mobility = true;
     let (turnsink, turnstream) = c.build_and_send_request(udp).split();
     let f = turnstream.map(move |x| {
             //println!("{:?}", x);
@@ -41,6 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 Err(e) => {
                     eprintln!("{}", e);
+                    MessageToTurnServer::Noop
+                }
+                Ok(MessageFromTurnServer::NetworkChange) => {
+                    eprintln!("Network change");
                     MessageToTurnServer::Noop
                 }
                 _ => MessageToTurnServer::Noop,

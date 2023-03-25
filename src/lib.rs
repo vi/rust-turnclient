@@ -41,6 +41,7 @@ extern crate rand;
 
 extern crate futures;
 extern crate tokio;
+use stun_codec::rfc8016::attributes::MobilityTicket;
 use tokio::net as tokio_udp;
 use tokio::time as tokio_timer;
 
@@ -96,6 +97,7 @@ mod attrs {
     // Taken from rusturn/src/attribute.rs
     use stun_codec::rfc5389::attributes::*;
     use stun_codec::rfc5766::attributes::*;
+    use stun_codec::rfc8016::attributes::*;
 
     define_attribute_enums!(
         Attribute,
@@ -123,7 +125,9 @@ mod attrs {
             EvenPort,
             RequestedTransport,
             DontFragment,
-            ReservationToken
+            ReservationToken,
+            // RFC 8016
+            MobilityTicket
         ]
     );
 
@@ -161,6 +165,8 @@ pub struct TurnClientBuilder {
     /// `SOFTWARE` attribute value in requests
     /// None means no attribute
     pub software: Option<&'static str>,
+    /// Enable support of RFC 8016 (handling IP address changes)
+    pub enable_mobility: bool,
 }
 
 impl TurnClientBuilder {
@@ -174,6 +180,7 @@ impl TurnClientBuilder {
             retry_interval: Duration::from_secs(1),
             refresh_interval: Duration::from_secs(30),
             software: Some("SimpleRustTurnClient"),
+            enable_mobility: false,
         }
     }
 
@@ -182,6 +189,7 @@ impl TurnClientBuilder {
     /// Finish setting options and get object to be polled.
     /// Does not actually send the allocate request until returned `TurnClient` is polled.
     pub fn build_and_send_request(self, udp: UdpSocket) -> TurnClient {
+        let enable_mobility = self.enable_mobility;
         let mut tc = TurnClient{
             opts: self,
             udp,
@@ -199,8 +207,11 @@ impl TurnClientBuilder {
             shutdown: false,
 
             buffered_input_message: None,
+
+            mobility_ticket: if enable_mobility { Some(MobilityTicket::empty()) } else { None },
+            mobility_refresh_in_progress: false,
         };
-        tc.send_allocate_request(false).unwrap();
+        tc.send_allocate_request(false, true).unwrap();
         tc
     }
 }
@@ -218,6 +229,8 @@ pub enum MessageFromTurnServer {
         mapped_address: SocketAddr,
         /// SERVER attribute returned by TURN server, if any.
         server_software: Option<String>,
+        /// We have received a Mobility Ticket (RFC 8016).
+        mobility: bool,
     },
 
     /// Server is busy and requesting us to use alternative server.
@@ -245,6 +258,9 @@ pub enum MessageFromTurnServer {
 
     /// A packet from wrong address or an unexpected STUN/TURN message or just malformed
     ForeignPacket(SocketAddr, Vec<u8>),
+
+    /// Mobility (RFC 8016) detected mapped address change
+    NetworkChange,
 }
 
 enum InflightRequestStatus {
@@ -278,6 +294,9 @@ pub enum MessageToTurnServer {
 
     /// Expire the allocation and stop emitting new requests
     Disconnect,
+
+    /// Refresh the allocation now, adding mobility ticket if available.
+    ForceRefreshWithMobility,
 }
 
 struct CompletionHooks {
@@ -358,6 +377,9 @@ pub struct TurnClient {
     shutdown: bool,
 
     buffered_input_message: Option<MessageToTurnServer>,
+
+    mobility_ticket: Option<MobilityTicket>,
+    mobility_refresh_in_progress: bool,
 }
 
 /// Simple TURN client in form of `Stream<Item=MessageFromTurnServer>` and `Sink<SinkItem=MessageToTurnServer>`.
@@ -383,11 +405,15 @@ fn gen_transaction_id() -> TransactionId {
 
 impl TurnClient {
     /// Send allocate or refresh request
-    fn send_allocate_request(&mut self, shutdown: bool) -> Result<(), Error> {
+    fn send_allocate_request(&mut self, shutdown: bool, enable_mobility: bool) -> Result<(), Error> {
         let transid = gen_transaction_id();
 
         let method = if self.when_to_renew_the_allocation.is_none() {
-            ALLOCATE
+            if self.mobility_refresh_in_progress {
+                REFRESH
+            } else {
+                ALLOCATE
+            }
         } else {
             REFRESH
         };
@@ -403,6 +429,12 @@ impl TurnClient {
             message.add_attribute(Attribute::RequestedTransport(
                 RequestedTransport::new(17 /* UDP */)
             ));
+        }
+
+        if enable_mobility {
+            if let Some(mt) = &self.mobility_ticket {
+                message.add_attribute(Attribute::MobilityTicket(mt.clone()));
+            }
         }
 
         if shutdown {
@@ -676,6 +708,14 @@ impl TurnClient {
                     let sw = decoded.get_attribute::<Software>().as_ref().map(|x|x.description());
                     let lt = decoded.get_attribute::<Lifetime>().ok_or(anyhow!("No Lifetime in reply"))?;
 
+                    if let Some(_mt) = self.mobility_ticket.take() {
+                        if let Some(mt_reply) = decoded.get_attribute::<MobilityTicket>() {
+                            self.mobility_ticket = Some(mt_reply.clone());
+                        } else {
+                            // drop mobility support for this session
+                        }
+                    }
+
                     let lt = self.process_alloc_lifetime(lt.lifetime());
 
                     /* Big state change */
@@ -687,6 +727,7 @@ impl TurnClient {
                         relay_address: ra.address(),
                         mapped_address: ma.address(),
                         server_software: sw.map(|x|x.to_owned()),
+                        mobility: self.mobility_ticket.is_some(),
                     };
                     return Ok(ret)
                 },
@@ -708,7 +749,7 @@ impl TurnClient {
                             self.realm = Some(re.clone());
                             self.nonce = Some(no.clone());
 
-                            self.send_allocate_request(false)?;
+                            self.send_allocate_request(false, true)?;
                         },
                         300 => {
                             let ta = decoded.get_attribute::<AlternateServer>()
@@ -743,8 +784,18 @@ impl TurnClient {
 
                             let lt = self.process_alloc_lifetime(lt.lifetime());
 
+                            if let Some(_mt) = self.mobility_ticket.take() {
+                                if let Some(mt_reply) = decoded.get_attribute::<MobilityTicket>() {
+                                    self.mobility_ticket = Some(mt_reply.clone());
+                                }
+                            }
+
                             self.when_to_renew_the_allocation = 
                                 Some(Box::pin(tokio_timer::sleep_until(Instant::now() + lt)));
+                            if self.mobility_refresh_in_progress {
+                                self.mobility_refresh_in_progress = false;
+                                return Ok(MessageFromTurnServer::NetworkChange);
+                            }
                         },
                         CREATE_PERMISSION => {
                             bail!("Reached unreachable code: CREATE_PERMISSION should be handled elsewhere")
@@ -756,7 +807,14 @@ impl TurnClient {
                 },
                 ErrorResponse => {
                     let ec = decoded.get_attribute::<ErrorCode>()
-                            .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?.code();
+                    .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?.code();
+                    if decoded.method() == REFRESH && ec == 437 && !self.mobility_refresh_in_progress {
+                        if self.mobility_ticket.is_some() {
+                            self.mobility_refresh_in_progress = true;
+                            self.send_allocate_request(false, true)?;
+                            return Ok(MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled)
+                        }
+                    }
                     
                     bail!("Error from TURN: {}", ec);
                 },
@@ -852,7 +910,7 @@ impl Stream for TurnClient {
                     Poll::Ready(()) => {
                         let ri = this.opts.refresh_interval;
                         x.as_mut().reset(Instant::now() + ri);
-                        this.send_allocate_request(false)?;
+                        this.send_allocate_request(false, false)?;
                         continue 'main;
                     },
                 }
@@ -975,9 +1033,13 @@ impl Sink<MessageToTurnServer> for TurnClient {
                     }
                 },
                 Disconnect => {
-                    this.send_allocate_request(true)?;
+                    this.send_allocate_request(true, false)?;
                     continue 'main;
                 },
+                ForceRefreshWithMobility => {
+                    this.send_allocate_request(false, true)?;
+                    continue 'main;
+                }
             }
             return Poll::Ready(Ok(()))
         }
