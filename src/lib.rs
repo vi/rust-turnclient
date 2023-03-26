@@ -808,6 +808,14 @@ impl TurnClient {
                 ErrorResponse => {
                     let ec = decoded.get_attribute::<ErrorCode>()
                     .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?.code();
+
+                    if ec == 438 /* stale nonce */ && !self.mobility_refresh_in_progress {
+                        let new_nonce = decoded.get_attribute::<Nonce>().ok_or(anyhow!("Stale Nonce error without new Nonce?"))?;
+                        self.nonce = Some(new_nonce.clone());
+                        self.send_allocate_request(self.shutdown, false)?;
+                        return Ok(MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled)
+                    }
+
                     if decoded.method() == REFRESH && ec == 437 && !self.mobility_refresh_in_progress {
                         if self.mobility_ticket.is_some() {
                             self.mobility_refresh_in_progress = true;
