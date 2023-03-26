@@ -1,22 +1,22 @@
 #![deny(missing_docs)]
 
 //! Simple async TURN client.
-//! 
+//!
 //! Usage:
-//! 
+//!
 //! 1. Create `TurnClientBuilder`
 //! 2. `build_and_send_request`
 //! 3. `split` the resulting thing to `Stream` and `Sink`
 //! 4. Wait for `AllocationGranted` event from Stream
 //! 5. Create permission or channel with `AddPermission` message
 //! 6. Send datagrams to the peer with a `SendTo` message to `TurnClient`'s `Sink` interface, receive datagrams from the peer by handling `RecvFrom` message from `TurnClient`'s `Stream` interface.
-//! 
+//!
 //! You may want to build a `stream -> map -> sink` chain using `Stream::forward` or `Sink::send_all`.
-//! 
+//!
 //! You need to handle errors from `Stream::poll`, otherwise somebody can DoS your client by sending tricky packets.
-//! 
+//!
 //! Not implemented / TODO / cons:
-//! 
+//!
 //! * Removing permissions. They keep on getting refreshed until you close the entire allocation.
 //! * Quadratical complexity, linear number of UDP datagrams in case of N actibe permissions.
 //! * TCP or TLS transport.
@@ -25,12 +25,12 @@
 //! * Even/odd port allocation
 //! * Message-integrity is not checked for server replies.
 //! * Allocation-heavy, uses `Vec<u8>` for byte buffers.
-//! 
+//!
 //! Examples:
-//! 
+//!
 //! * `echo.rs` - Connect to specified TURN server, authorize specified peer and act as an echo server for it.
 
-const PERM_REFRESH_INTERVAL : u64 = 180;
+const PERM_REFRESH_INTERVAL: u64 = 180;
 
 extern crate bytecodec;
 #[macro_use]
@@ -41,10 +41,13 @@ extern crate rand;
 
 extern crate futures;
 extern crate tokio;
+use fnv::FnvHashSet;
 use stun_codec::rfc8016::attributes::MobilityTicket;
 use tokio::net as tokio_udp;
 use tokio::time as tokio_timer;
 
+use std::net::Ipv4Addr;
+use std::net::SocketAddrV4;
 use std::pin::Pin;
 
 extern crate fnv;
@@ -55,44 +58,27 @@ extern crate slab_typesafe;
 use stun_codec::{MessageDecoder, MessageEncoder};
 
 use bytecodec::{DecodeExt, EncodeExt};
-use std::net::{SocketAddr};
+use std::net::SocketAddr;
 use stun_codec::rfc5389::attributes::{
-    Software,
-    Realm,
-    Nonce,
-    ErrorCode,
-    MessageIntegrity,
-    Username,
+    AlternateServer, ErrorCode, MessageIntegrity, Nonce, Realm, Software, Username,
     XorMappedAddress,
-    AlternateServer,
 };
 use stun_codec::rfc5766::attributes::{
-    RequestedTransport,
-    XorRelayAddress,
-    XorPeerAddress,
-    Lifetime,
-    Data,
-    ChannelNumber,
+    ChannelNumber, Data, Lifetime, RequestedTransport, XorPeerAddress, XorRelayAddress,
 };
 //use stun_codec::rfc5389::{Attribute as StunAttribute};
 //use stun_codec::rfc5766::{Attribute as TurnAttribute};
-use stun_codec::rfc5766::methods::{
-    ALLOCATE,
-    REFRESH,
-    CREATE_PERMISSION,
-    CHANNEL_BIND,
-    SEND,
-};
-use stun_codec::{Message, MessageClass, TransactionId};
-use std::time::{Duration};
-use tokio::time::Instant;
 use self::attrs::Attribute;
+use std::time::Duration;
+use stun_codec::rfc5766::methods::{ALLOCATE, CHANNEL_BIND, CREATE_PERMISSION, REFRESH, SEND};
+use stun_codec::{Message, MessageClass, TransactionId};
+use tokio::time::Instant;
 
-use futures::{Stream, Sink, Future, task::Poll, task::Context};
+use futures::{task::Context, task::Poll, Future, Sink, Stream};
 
 use fnv::FnvHashMap as HashMap;
 
-mod attrs { 
+mod attrs {
     extern crate stun_codec;
     // Taken from rusturn/src/attribute.rs
     use stun_codec::rfc5389::attributes::*;
@@ -130,7 +116,6 @@ mod attrs {
             MobilityTicket
         ]
     );
-
 }
 
 /// `anyhow`-based error handling.
@@ -141,11 +126,9 @@ use anyhow::bail;
 
 use tokio_udp::UdpSocket;
 
-use tokio_timer::{Interval,Sleep as Delay};
+use tokio_timer::{Interval, Sleep as Delay};
 
 use slab_typesafe::Slab;
-
-
 
 /// Options for connecting to TURN server
 pub struct TurnClientBuilder {
@@ -190,7 +173,7 @@ impl TurnClientBuilder {
     /// Does not actually send the allocate request until returned `TurnClient` is polled.
     pub fn build_and_send_request(self, udp: UdpSocket) -> TurnClient {
         let enable_mobility = self.enable_mobility;
-        let mut tc = TurnClient{
+        let mut tc = TurnClient {
             opts: self,
             udp,
 
@@ -208,11 +191,112 @@ impl TurnClientBuilder {
 
             buffered_input_message: None,
 
-            mobility_ticket: if enable_mobility { Some(MobilityTicket::empty()) } else { None },
+            mobility_ticket: if enable_mobility {
+                Some(MobilityTicket::empty())
+            } else {
+                None
+            },
             mobility_refresh_in_progress: false,
         };
         tc.send_allocate_request(false, true).unwrap();
         tc
+    }
+
+    /// Set options and previously saved internal state of the allocation and triggers refresh
+    /// when returned objects starts being polled.
+    /// 
+    /// Warning: untested code
+    pub fn restore_from_exported_parameters(
+        self,
+        udp: UdpSocket,
+        params: &ExportedParameters,
+    ) -> anyhow::Result<TurnClient> {
+        let mut permissions : Slab<PermissionHandle, Permission> = Slab::with_capacity(params.permissions.len());
+        let mut sockaddr2perm =
+            HashMap::with_capacity_and_hasher(params.permissions.len(), Default::default());
+        let mut channelized_permissions: HashMap<usize, &SocketAddr> =
+            HashMap::with_capacity_and_hasher(params.permissions.len(), Default::default());
+        let mut unchannelized_permissions: Vec<SocketAddr> = Vec::new();
+        let mut max_channel_plus_one = 0usize;
+        let mut extra_slots_in_slab: FnvHashSet<PermissionHandle> =
+            FnvHashSet::with_hasher(Default::default());
+        for (sa, ch) in &params.permissions {
+            if let Some(x) = ch {
+                channelized_permissions.insert(*x as usize, sa);
+                max_channel_plus_one = max_channel_plus_one.max(*x as usize + 1);
+            } else {
+                unchannelized_permissions.push(*sa);
+            }
+        }
+        let max_slots_in_slab = max_channel_plus_one.max(params.permissions.len());
+        let mut unchannelized = unchannelized_permissions.into_iter();
+        for i in 0..max_slots_in_slab {
+            let ve = permissions.vacant_entry();
+            assert_eq!(ve.key().0, i);
+            use anyhow::Context;
+            if let Some(sa) = channelized_permissions.get(&i) {
+                ve.insert(Permission {
+                    addr: **sa,
+                    channelized: true,
+                    creation_already_reported: true,
+                });
+                sockaddr2perm.insert(**sa, PermissionToken::from_channel_number(i as u16).context("Internal errror?")?);
+            } else {
+                if let Some(sa) = unchannelized.next() {
+                    sockaddr2perm.insert(sa, PermissionToken::from_handle(ve.key(), false));
+                    ve.insert(Permission {
+                        addr: sa,
+                        channelized: false,
+                        creation_already_reported: true,
+                    });
+                } else {
+                    extra_slots_in_slab.insert(ve.key());
+                    ve.insert(Permission {
+                        addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                        channelized: false,
+                        creation_already_reported: false,
+                    });
+                }
+            }
+            for extra_slot in extra_slots_in_slab.iter() {
+                permissions.remove(*extra_slot);
+            }
+        }
+        Ok(TurnClient {
+            opts: self,
+            udp,
+            inflight: HashMap::default(),
+            when_to_renew_the_allocation: Some(Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::now(),
+            ))),
+            realm: if params.realm.is_empty() {
+                None
+            } else {
+                Some(Realm::new(params.realm.clone())?)
+            },
+            nonce: if params.nonce.is_empty() {
+                None
+            } else {
+                Some(Nonce::new(params.nonce.clone())?)
+            },
+            permissions,
+            sockaddr2perm,
+            permissions_pinger: if params.permissions.is_empty() {
+                None
+            } else {
+                Some(tokio_timer::interval(Duration::from_secs(
+                    PERM_REFRESH_INTERVAL,
+                )))
+            },
+            shutdown: false,
+            buffered_input_message: None,
+            mobility_ticket: if params.mobility_ticket.is_empty() {
+                None
+            } else {
+                Some(MobilityTicket::new(params.mobility_ticket.clone())?)
+            },
+            mobility_refresh_in_progress: false,
+        })
     }
 }
 
@@ -271,7 +355,7 @@ enum InflightRequestStatus {
 
 /// Whether to just create permission of also allocate a channel for it.
 /// I don't see much reasons not to allocate a channel.
-#[derive(Debug,PartialEq,Eq,Ord,PartialOrd,Hash,Clone,Copy)]
+#[derive(Debug, PartialEq, Eq, Ord, PartialOrd, Hash, Clone, Copy)]
 pub enum ChannelUsage {
     /// Create a channel, resulting in shorter datagrams between you and TURN for this peer.
     WithChannel,
@@ -300,8 +384,8 @@ pub enum MessageToTurnServer {
 }
 
 struct CompletionHooks {
-    success: Box<dyn FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error> + Send>,
-    failure: Box<dyn FnMut(&mut TurnClient)->Result<Option<MessageFromTurnServer>,Error> + Send>,
+    success: Box<dyn FnMut(&mut TurnClient) -> Result<Option<MessageFromTurnServer>, Error> + Send>,
+    failure: Box<dyn FnMut(&mut TurnClient) -> Result<Option<MessageFromTurnServer>, Error> + Send>,
 }
 
 /// Unaccepted request being retried
@@ -315,7 +399,7 @@ struct InflightRequest {
 declare_slab_token!(PermissionHandle);
 
 // if high bit is set then it is a non-channelized permission
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy)]
 struct PermissionToken(u32);
 
 impl PermissionToken {
@@ -351,9 +435,22 @@ impl PermissionToken {
 
 /// Association between TURN client and it's peer
 struct Permission {
-    addr : SocketAddr,
+    addr: SocketAddr,
     channelized: bool,
     creation_already_reported: bool,
+}
+
+/// Exported parameters for resuming allocation
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExportedParameters {
+    /// Realm or empty string
+    pub realm: String,
+    /// Nonce or empty string if none
+    pub nonce: String,
+    /// Mobility ticker or an empty vector if there is none
+    pub mobility_ticket: Vec<u8>,
+    /// List of permissions with optional channel numbers
+    pub permissions: Vec<(SocketAddr, Option<u16>)>,
 }
 
 /// The thing to be `split` to `Stream<Item=MessageFromTurnServer>` and `Sink<Item=MessageToTurnServer>`.
@@ -383,10 +480,10 @@ pub struct TurnClient {
 }
 
 /// Simple TURN client in form of `Stream<Item=MessageFromTurnServer>` and `Sink<SinkItem=MessageToTurnServer>`.
-/// 
+///
 /// Stream side should be continually polled, or the client expires.
 /// Requests are actually sent by `Stream`'s poll.
-/// 
+///
 /// Use `Stream::split`.
 impl TurnClient {
     /// Consume this TURN client, returning back control of used UDP socket
@@ -394,6 +491,46 @@ impl TurnClient {
     /// TURN server
     pub fn into_udp_socket(self) -> UdpSocket {
         self.udp
+    }
+
+    /// Serialize parameters of this TURN allocation to move it somewhere else (e.g. using mobility).
+    pub fn export_state(&self) -> ExportedParameters {
+        ExportedParameters {
+            realm: self
+                .realm
+                .as_ref()
+                .map(|x| x.text())
+                .unwrap_or_default()
+                .to_owned(),
+            nonce: self
+                .nonce
+                .as_ref()
+                .map(|x| x.value())
+                .unwrap_or_default()
+                .to_owned(),
+            mobility_ticket: self
+                .mobility_ticket
+                .as_ref()
+                .map(|x| x.data().to_owned())
+                .unwrap_or_default(),
+            permissions: self
+                .permissions
+                .iter()
+                .map(|p| {
+                    (
+                        p.1.addr,
+                        if p.1.channelized {
+                            match self.sockaddr2perm.get(&p.1.addr) {
+                                Some(pt) => pt.as_channel_number(),
+                                None => None,
+                            }
+                        } else {
+                            None
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 }
 
@@ -405,7 +542,11 @@ fn gen_transaction_id() -> TransactionId {
 
 impl TurnClient {
     /// Send allocate or refresh request
-    fn send_allocate_request(&mut self, shutdown: bool, enable_mobility: bool) -> Result<(), Error> {
+    fn send_allocate_request(
+        &mut self,
+        shutdown: bool,
+        enable_mobility: bool,
+    ) -> Result<(), Error> {
         let transid = gen_transaction_id();
 
         let method = if self.when_to_renew_the_allocation.is_none() {
@@ -417,18 +558,16 @@ impl TurnClient {
         } else {
             REFRESH
         };
-        let mut message : Message<Attribute> = Message::new(MessageClass::Request, method, transid);
-              
+        let mut message: Message<Attribute> = Message::new(MessageClass::Request, method, transid);
+
         if let Some(s) = self.opts.software {
-            message.add_attribute(Attribute::Software(Software::new(
-                s.to_owned(),
-            )?));
+            message.add_attribute(Attribute::Software(Software::new(s.to_owned())?));
         }
-        
+
         if method == ALLOCATE {
-            message.add_attribute(Attribute::RequestedTransport(
-                RequestedTransport::new(17 /* UDP */)
-            ));
+            message.add_attribute(Attribute::RequestedTransport(RequestedTransport::new(
+                17, /* UDP */
+            )));
         }
 
         if enable_mobility {
@@ -438,14 +577,12 @@ impl TurnClient {
         }
 
         if shutdown {
-            message.add_attribute(Attribute::Lifetime(
-                Lifetime::new(Duration::from_secs(0))?
-            ));
+            message.add_attribute(Attribute::Lifetime(Lifetime::new(Duration::from_secs(0))?));
         }
-        
+
         self.sign_request(&mut message)?;
         self.file_request(transid, message, None)?;
-    
+
         Ok(())
     }
 
@@ -461,35 +598,34 @@ impl TurnClient {
         lt
     }
 
-    fn sign_request(&self, message: &mut Message<Attribute>) -> Result<(),Error> {
+    fn sign_request(&self, message: &mut Message<Attribute>) -> Result<(), Error> {
         let username = Username::new(self.opts.username.clone())?;
-        message.add_attribute(Attribute::Username(
-            username.clone()
-        ));
+        message.add_attribute(Attribute::Username(username.clone()));
 
         if let (Some(re), Some(no)) = (self.realm.clone(), self.nonce.clone()) {
             message.add_attribute(Attribute::Realm(re.clone()));
             message.add_attribute(Attribute::Nonce(no));
-        
+
             message.add_attribute(Attribute::MessageIntegrity(
                 MessageIntegrity::new_long_term_credential(
-                        &message, 
-                        &username,
-                        &re,
-                        self.opts.password.as_str())?
+                    &message,
+                    &username,
+                    &re,
+                    self.opts.password.as_str(),
+                )?,
             ));
         }
         Ok(())
     }
 
     fn file_request(
-                &mut self, 
-                transid: TransactionId,
-                message: Message<Attribute>,
-                completion_hook: Option<CompletionHooks>,
-    ) -> Result<(),Error> {
+        &mut self,
+        transid: TransactionId,
+        message: Message<Attribute>,
+        completion_hook: Option<CompletionHooks>,
+    ) -> Result<(), Error> {
         if self.shutdown {
-            return Ok(())
+            return Ok(());
         }
         // Encodes the message
         let mut encoder = MessageEncoder::new();
@@ -509,7 +645,6 @@ impl TurnClient {
     fn send_perm_request(&mut self, h: PermissionHandle) -> Result<(), Error> {
         let p = &self.permissions[h];
 
-        
         let transid = gen_transaction_id();
 
         let method = if p.channelized {
@@ -517,27 +652,23 @@ impl TurnClient {
         } else {
             CREATE_PERMISSION
         };
-        let mut message : Message<Attribute> = Message::new(MessageClass::Request, method, transid);
-              
+        let mut message: Message<Attribute> = Message::new(MessageClass::Request, method, transid);
+
         if let Some(s) = self.opts.software {
-            message.add_attribute(Attribute::Software(Software::new(
-                s.to_owned(),
-            )?));
+            message.add_attribute(Attribute::Software(Software::new(s.to_owned())?));
         }
 
-        message.add_attribute(Attribute::XorPeerAddress(
-            XorPeerAddress::new(p.addr)
-        ));
+        message.add_attribute(Attribute::XorPeerAddress(XorPeerAddress::new(p.addr)));
 
         if p.channelized {
-            let chn = PermissionToken::from_handle( h,true).as_channel_number().ok_or(anyhow!("Channel number overflow"))?;
-            message.add_attribute(Attribute::ChannelNumber(
-                ChannelNumber::new(chn)?
-            ));
+            let chn = PermissionToken::from_handle(h, true)
+                .as_channel_number()
+                .ok_or(anyhow!("Channel number overflow"))?;
+            message.add_attribute(Attribute::ChannelNumber(ChannelNumber::new(chn)?));
         }
 
-        let hooks = CompletionHooks { 
-            success : Box::new(move |_self|{
+        let hooks = CompletionHooks {
+            success: Box::new(move |_self| {
                 let p = &mut _self.permissions[h];
                 let msg = if p.creation_already_reported {
                     MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled
@@ -547,7 +678,7 @@ impl TurnClient {
                 };
                 Ok(Some(msg))
             }),
-            failure : Box::new(move |_self|{
+            failure: Box::new(move |_self| {
                 let p = &mut _self.permissions[h];
                 let msg = if p.creation_already_reported {
                     MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled
@@ -561,50 +692,56 @@ impl TurnClient {
 
         self.sign_request(&mut message)?;
         self.file_request(transid, message, Some(hooks))?;
-    
+
         Ok(())
     }
-    
+
     /// Send data to the socket where it is known in advance that a datagram would surely be accepted, not `Poll::Pending`
-    fn send_data_indication(&mut self, cx: &mut Context, sa: SocketAddr, data: &[u8]) -> Poll<Result<(),Error>> {
+    fn send_data_indication(
+        &mut self,
+        cx: &mut Context,
+        sa: SocketAddr,
+        data: &[u8],
+    ) -> Poll<Result<(), Error>> {
         if let Some(p) = self.sockaddr2perm.get(&sa) {
             if let Some(cn) = p.as_channel_number() {
                 let mut b = Vec::with_capacity(data.len() + 4);
                 let l = data.len();
-                b.push( ((cn & 0xFF00) >> 8) as u8);
-                b.push( ((cn & 0x00FF) >> 0) as u8);
-                b.push( ((l  & 0xFF00) >> 8) as u8);
-                b.push( ((l  & 0x00FF) >> 0) as u8);
+                b.push(((cn & 0xFF00) >> 8) as u8);
+                b.push(((cn & 0x00FF) >> 0) as u8);
+                b.push(((l & 0xFF00) >> 8) as u8);
+                b.push(((l & 0x00FF) >> 0) as u8);
                 b.extend_from_slice(&data[..]);
 
-                match self.udp.poll_send_to(cx,&b[..], self.opts.turn_server) {
-                    Poll::Ready(Err(e))=>return Poll::Ready(Err(e.into())),
+                match self.udp.poll_send_to(cx, &b[..], self.opts.turn_server) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(len)) => {
-                        if len == l+4 {
-                            return Poll::Ready(Ok(()))
+                        if len == l + 4 {
+                            return Poll::Ready(Ok(()));
                         } else {
-                            return Poll::Ready(Err(anyhow!("Invalid length of a sent UDP datagram")));
+                            return Poll::Ready(Err(anyhow!(
+                                "Invalid length of a sent UDP datagram"
+                            )));
                         }
                     }
                 }
                 #[allow(unreachable_code)]
-                { unreachable!() }
+                {
+                    unreachable!()
+                }
             }
         }
 
         let transid = gen_transaction_id();
 
         let method = SEND;
-        let mut message : Message<Attribute> = Message::new(MessageClass::Indication, method, transid);
-          
-        message.add_attribute(Attribute::XorPeerAddress(
-            XorPeerAddress::new(sa)
-        ));
-        message.add_attribute(Attribute::Data(
-            Data::new(data.to_vec())?
-        ));
-        
+        let mut message: Message<Attribute> =
+            Message::new(MessageClass::Indication, method, transid);
+
+        message.add_attribute(Attribute::XorPeerAddress(XorPeerAddress::new(sa)));
+        message.add_attribute(Attribute::Data(Data::new(data.to_vec())?));
+
         let mut encoder = MessageEncoder::new();
         let bytes = encoder.encode_into_bytes(message)?;
 
@@ -613,7 +750,7 @@ impl TurnClient {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Ok(len)) => {
                 if len == bytes.len() {
-                    return Poll::Ready(Ok(()))
+                    return Poll::Ready(Ok(()));
                 } else {
                     return Poll::Ready(Err(anyhow!("Invalid length of a sent UDP datagram")));
                 }
@@ -622,9 +759,9 @@ impl TurnClient {
     }
 
     /// Handle incoming packet from TURN server
-    fn handle_incoming_packet(&mut self, buf:&[u8]) -> Result<MessageFromTurnServer, Error> {
+    fn handle_incoming_packet(&mut self, buf: &[u8]) -> Result<MessageFromTurnServer, Error> {
         use self::MessageFromTurnServer::*;
-        use stun_codec::MessageClass::{SuccessResponse, ErrorResponse, Indication, Request};
+        use stun_codec::MessageClass::{ErrorResponse, Indication, Request, SuccessResponse};
 
         let mut foreign_packet = false;
 
@@ -633,22 +770,19 @@ impl TurnClient {
             foreign_packet = true;
         } else {
             if buf[0] >= 0x40 && buf[0] <= 0x7F {
-                let chnum = (buf[0] as u16)<<8  |  (buf[1] as u16);
+                let chnum = (buf[0] as u16) << 8 | (buf[1] as u16);
                 let len = (buf[2] as u16) << 8 | (buf[3] as u16);
 
                 let h = PermissionToken::from_channel_number(chnum);
 
-                if h.is_none() || buf.len() < (len as usize)+4 {
+                if h.is_none() || buf.len() < (len as usize) + 4 {
                     foreign_packet = true;
                 } else {
                     if let Some(p) = self.permissions.get(h.unwrap().as_handle()) {
-                        return Ok(MessageFromTurnServer::RecvFrom(
-                            p.addr,
-                            buf[4..].to_vec(),
-                        ))
+                        return Ok(MessageFromTurnServer::RecvFrom(p.addr, buf[4..].to_vec()));
                     } else {
                         foreign_packet = true;
-                    } 
+                    }
                 }
             }
         }
@@ -672,8 +806,12 @@ impl TurnClient {
         let tid = decoded.transaction_id();
 
         if decoded.class() == Indication {
-            let pa = decoded.get_attribute::<XorPeerAddress>().ok_or(anyhow!("No XorPeerAddress in data indication"))?;
-            let data = decoded.get_attribute::<Data>().ok_or(anyhow!("No Data attribute in indication"))?;
+            let pa = decoded
+                .get_attribute::<XorPeerAddress>()
+                .ok_or(anyhow!("No XorPeerAddress in data indication"))?;
+            let data = decoded
+                .get_attribute::<Data>()
+                .ok_or(anyhow!("No Data attribute in indication"))?;
 
             return Ok(MessageFromTurnServer::RecvFrom(
                 pa.address(),
@@ -689,12 +827,16 @@ impl TurnClient {
                 match decoded.class() {
                     Request => bail!("Server replied to our request with another request?"),
                     Indication => bail!("Server replied to our request with an indication?"),
-                    SuccessResponse => if let Some(ret) = (*h.success)(self)? {
-                        return Ok(ret);
-                    },
-                    ErrorResponse => if let Some(ret) = (*h.failure)(self)? {
-                        return Ok(ret);
-                    },
+                    SuccessResponse => {
+                        if let Some(ret) = (*h.success)(self)? {
+                            return Ok(ret);
+                        }
+                    }
+                    ErrorResponse => {
+                        if let Some(ret) = (*h.failure)(self)? {
+                            return Ok(ret);
+                        }
+                    }
                 }
             }
         }
@@ -703,10 +845,19 @@ impl TurnClient {
             // Not yet acquired an allocation
             match decoded.class() {
                 SuccessResponse => {
-                    let ra = decoded.get_attribute::<XorRelayAddress>().ok_or(anyhow!("No XorRelayAddress in reply"))?;
-                    let ma = decoded.get_attribute::<XorMappedAddress>().ok_or(anyhow!("No XorMappedAddress in reply"))?;
-                    let sw = decoded.get_attribute::<Software>().as_ref().map(|x|x.description());
-                    let lt = decoded.get_attribute::<Lifetime>().ok_or(anyhow!("No Lifetime in reply"))?;
+                    let ra = decoded
+                        .get_attribute::<XorRelayAddress>()
+                        .ok_or(anyhow!("No XorRelayAddress in reply"))?;
+                    let ma = decoded
+                        .get_attribute::<XorMappedAddress>()
+                        .ok_or(anyhow!("No XorMappedAddress in reply"))?;
+                    let sw = decoded
+                        .get_attribute::<Software>()
+                        .as_ref()
+                        .map(|x| x.description());
+                    let lt = decoded
+                        .get_attribute::<Lifetime>()
+                        .ok_or(anyhow!("No Lifetime in reply"))?;
 
                     if let Some(_mt) = self.mobility_ticket.take() {
                         if let Some(mt_reply) = decoded.get_attribute::<MobilityTicket>() {
@@ -719,21 +870,24 @@ impl TurnClient {
                     let lt = self.process_alloc_lifetime(lt.lifetime());
 
                     /* Big state change */
-                    self.when_to_renew_the_allocation = 
-                        Some(Box::pin(tokio::time::sleep_until(tokio::time::Instant::now() + lt)));
+                    self.when_to_renew_the_allocation = Some(Box::pin(tokio::time::sleep_until(
+                        tokio::time::Instant::now() + lt,
+                    )));
                     /* Big state echange */
 
                     let ret = AllocationGranted {
                         relay_address: ra.address(),
                         mapped_address: ma.address(),
-                        server_software: sw.map(|x|x.to_owned()),
+                        server_software: sw.map(|x| x.to_owned()),
                         mobility: self.mobility_ticket.is_some(),
                     };
-                    return Ok(ret)
-                },
+                    return Ok(ret);
+                }
                 ErrorResponse => {
-                    let ec = decoded.get_attribute::<ErrorCode>()
-                            .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?.code();
+                    let ec = decoded
+                        .get_attribute::<ErrorCode>()
+                        .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?
+                        .code();
 
                     match ec {
                         401 => {
@@ -741,101 +895,112 @@ impl TurnClient {
                                 bail!("Authentication failed");
                             }
 
-                            let re = decoded.get_attribute::<Realm>()
-                                    .ok_or(anyhow!("Missing Realm in NotAuthorized response"))?;
-                            let no = decoded.get_attribute::<Nonce>()
-                                    .ok_or(anyhow!("Missing Nonce in NotAuthorized response"))?;
-                            
+                            let re = decoded
+                                .get_attribute::<Realm>()
+                                .ok_or(anyhow!("Missing Realm in NotAuthorized response"))?;
+                            let no = decoded
+                                .get_attribute::<Nonce>()
+                                .ok_or(anyhow!("Missing Nonce in NotAuthorized response"))?;
+
                             self.realm = Some(re.clone());
                             self.nonce = Some(no.clone());
 
                             self.send_allocate_request(false, true)?;
-                        },
+                        }
                         300 => {
-                            let ta = decoded.get_attribute::<AlternateServer>()
-                                    .ok_or(anyhow!("Redirect without AlternateServer"))?;
+                            let ta = decoded
+                                .get_attribute::<AlternateServer>()
+                                .ok_or(anyhow!("Redirect without AlternateServer"))?;
                             return Ok(RedirectedToAlternateServer(ta.address()));
-                        },
+                        }
                         _ => {
                             Err(anyhow!("Unknown error code from TURN: {}", ec))?;
                         }
                     }
-                },
+                }
                 Indication => {
                     bail!("Indication when not allocated anything")
-                },
+                }
                 Request => {
                     bail!("Received a Request instead of Response from server")
-                },
+                }
             }
         } else {
             // There is an allocation currently
             match decoded.class() {
-                SuccessResponse => {
-                    match decoded.method() {    
-                        REFRESH => {
-                            let lt = decoded.get_attribute::<Lifetime>().ok_or(anyhow!("No Lifetime in reply"))?;
-                            
-                            if lt.lifetime() == Duration::from_secs(0) {
-                                self.when_to_renew_the_allocation = None;
-                                self.shutdown = true;
-                                return Ok(MessageFromTurnServer::Disconnected);
-                            }
+                SuccessResponse => match decoded.method() {
+                    REFRESH => {
+                        let lt = decoded
+                            .get_attribute::<Lifetime>()
+                            .ok_or(anyhow!("No Lifetime in reply"))?;
 
-                            let lt = self.process_alloc_lifetime(lt.lifetime());
+                        if lt.lifetime() == Duration::from_secs(0) {
+                            self.when_to_renew_the_allocation = None;
+                            self.shutdown = true;
+                            return Ok(MessageFromTurnServer::Disconnected);
+                        }
 
-                            if let Some(_mt) = self.mobility_ticket.take() {
-                                if let Some(mt_reply) = decoded.get_attribute::<MobilityTicket>() {
-                                    self.mobility_ticket = Some(mt_reply.clone());
-                                }
-                            }
+                        let lt = self.process_alloc_lifetime(lt.lifetime());
 
-                            self.when_to_renew_the_allocation = 
-                                Some(Box::pin(tokio_timer::sleep_until(Instant::now() + lt)));
-                            if self.mobility_refresh_in_progress {
-                                self.mobility_refresh_in_progress = false;
-                                return Ok(MessageFromTurnServer::NetworkChange);
+                        if let Some(_mt) = self.mobility_ticket.take() {
+                            if let Some(mt_reply) = decoded.get_attribute::<MobilityTicket>() {
+                                self.mobility_ticket = Some(mt_reply.clone());
                             }
-                        },
-                        CREATE_PERMISSION => {
-                            bail!("Reached unreachable code: CREATE_PERMISSION should be handled elsewhere")
-                        },
-                        x => {
-                            bail!("Not implemented: success response for {:?}", x)
-                        },
+                        }
+
+                        self.when_to_renew_the_allocation =
+                            Some(Box::pin(tokio_timer::sleep_until(Instant::now() + lt)));
+                        if self.mobility_refresh_in_progress {
+                            self.mobility_refresh_in_progress = false;
+                            return Ok(MessageFromTurnServer::NetworkChange);
+                        }
+                    }
+                    CREATE_PERMISSION => {
+                        bail!("Reached unreachable code: CREATE_PERMISSION should be handled elsewhere")
+                    }
+                    x => {
+                        bail!("Not implemented: success response for {:?}", x)
                     }
                 },
                 ErrorResponse => {
-                    let ec = decoded.get_attribute::<ErrorCode>()
-                    .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?.code();
+                    let ec = decoded
+                        .get_attribute::<ErrorCode>()
+                        .ok_or(anyhow!("ErrorResponse without ErrorCode?"))?
+                        .code();
 
                     if ec == 438 /* stale nonce */ && !self.mobility_refresh_in_progress {
-                        let new_nonce = decoded.get_attribute::<Nonce>().ok_or(anyhow!("Stale Nonce error without new Nonce?"))?;
+                        let new_nonce = decoded
+                            .get_attribute::<Nonce>()
+                            .ok_or(anyhow!("Stale Nonce error without new Nonce?"))?;
                         self.nonce = Some(new_nonce.clone());
                         self.send_allocate_request(self.shutdown, false)?;
-                        return Ok(MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled)
+                        return Ok(MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled);
                     }
 
-                    if decoded.method() == REFRESH && ec == 437 && !self.mobility_refresh_in_progress {
+                    if decoded.method() == REFRESH
+                        && ec == 437
+                        && !self.mobility_refresh_in_progress
+                    {
                         if self.mobility_ticket.is_some() {
                             self.mobility_refresh_in_progress = true;
                             self.send_allocate_request(false, true)?;
-                            return Ok(MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled)
+                            return Ok(
+                                MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled,
+                            );
                         }
                     }
-                    
+
                     bail!("Error from TURN: {}", ec);
-                },
+                }
                 Indication => {
                     bail!("Not implemented: handling indications");
-                },
+                }
                 Request => {
                     bail!("Received a Request instead of Response from server");
-                },
+                }
             }
-            
         }
-        
+
         Ok(MessageFromTurnServer::APacketIsReceivedAndAutomaticallyHandled)
     }
 }
@@ -843,8 +1008,11 @@ impl TurnClient {
 impl Stream for TurnClient {
     type Item = Result<MessageFromTurnServer, Error>;
 
-    fn poll_next(self: Pin<&mut TurnClient>, cx: &mut Context) -> Poll<Option<Result<MessageFromTurnServer,Error>>> {
-        let this : &mut TurnClient = Pin::into_inner(self);
+    fn poll_next(
+        self: Pin<&mut TurnClient>,
+        cx: &mut Context,
+    ) -> Poll<Option<Result<MessageFromTurnServer, Error>>> {
+        let this: &mut TurnClient = Pin::into_inner(self);
         'main: loop {
             if this.shutdown {
                 return Poll::Ready(None);
@@ -854,17 +1022,20 @@ impl Stream for TurnClient {
             let mut buf = tokio::io::ReadBuf::new(&mut buf[..]);
             // TURN client's jobs (running in parallel):
             // 1. Handle incoming packets
-            match this.udp.poll_recv_from(cx,&mut buf) {
+            match this.udp.poll_recv_from(cx, &mut buf) {
                 Poll::Pending => (),
                 Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
                 Poll::Ready(Ok(addr)) => {
                     let buf = buf.filled();
                     if addr != this.opts.turn_server {
-                        return Poll::Ready(Some(Ok(MessageFromTurnServer::ForeignPacket(addr,buf.to_vec()))));
+                        return Poll::Ready(Some(Ok(MessageFromTurnServer::ForeignPacket(
+                            addr,
+                            buf.to_vec(),
+                        ))));
                     }
                     let ret = this.handle_incoming_packet(buf)?;
                     return Poll::Ready(Some(Ok(ret)));
-                },
+                }
             }
 
             // 2. Periodically re-send unreplied requests
@@ -875,32 +1046,35 @@ impl Stream for TurnClient {
                 match &mut rq.status {
                     InflightRequestStatus::TimedOut => {
                         remove_this_stale_rqs.push(*k);
-                    },
+                    }
                     InflightRequestStatus::SendNow => {
-                        match this.udp.poll_send_to(cx, &rq.data[..], this.opts.turn_server) {
-                            Poll::Ready(Err(e))=>Err(e)?,
-                            Poll::Pending=>(),
+                        match this
+                            .udp
+                            .poll_send_to(cx, &rq.data[..], this.opts.turn_server)
+                        {
+                            Poll::Ready(Err(e)) => Err(e)?,
+                            Poll::Pending => (),
                             Poll::Ready(Ok(len)) => {
                                 assert_eq!(len, rq.data.len());
-                                let d = tokio_timer::sleep_until(Instant::now() + this.opts.retry_interval);
+                                let d = tokio_timer::sleep_until(
+                                    Instant::now() + this.opts.retry_interval,
+                                );
                                 rq.status = InflightRequestStatus::RetryLater(Box::pin(d));
 
                                 continue 'main;
-                            },
+                            }
                         }
-                    },
-                    InflightRequestStatus::RetryLater(ref mut d) => {
-                        match d.as_mut().poll(cx) {
-                            Poll::Pending=>(),
-                            Poll::Ready(()) => {
-                                rq.retryctr += 1;
-                                if rq.retryctr >= this.opts.max_retries {
-                                    rq.status = InflightRequestStatus::TimedOut;
-                                    Err(anyhow!("Request timed out"))?;
-                                } else {
-                                    rq.status = InflightRequestStatus::SendNow;
-                                    continue 'main;
-                                }
+                    }
+                    InflightRequestStatus::RetryLater(ref mut d) => match d.as_mut().poll(cx) {
+                        Poll::Pending => (),
+                        Poll::Ready(()) => {
+                            rq.retryctr += 1;
+                            if rq.retryctr >= this.opts.max_retries {
+                                rq.status = InflightRequestStatus::TimedOut;
+                                Err(anyhow!("Request timed out"))?;
+                            } else {
+                                rq.status = InflightRequestStatus::SendNow;
+                                continue 'main;
                             }
                         }
                     },
@@ -920,7 +1094,7 @@ impl Stream for TurnClient {
                         x.as_mut().reset(Instant::now() + ri);
                         this.send_allocate_request(false, false)?;
                         continue 'main;
-                    },
+                    }
                 }
             }
 
@@ -933,7 +1107,7 @@ impl Stream for TurnClient {
                         for (h, _) in this.permissions.iter() {
                             ids_to_refresh.push(h);
                         }
-                    },
+                    }
                 }
             }
             if !ids_to_refresh.is_empty() {
@@ -944,7 +1118,7 @@ impl Stream for TurnClient {
                 continue 'main;
             }
 
-            return Poll::Pending // don't care which one in particular is not ready
+            return Poll::Pending; // don't care which one in particular is not ready
         } // loop
     }
 }
@@ -956,12 +1130,12 @@ impl Sink<MessageToTurnServer> for TurnClient {
         self.poll_flush(cx)
     }
 
-    fn start_send(mut self : Pin<&mut Self>, msg: MessageToTurnServer) -> Result<(),Error> {
+    fn start_send(mut self: Pin<&mut Self>, msg: MessageToTurnServer) -> Result<(), Error> {
         if self.shutdown {
             return Err(anyhow!("TURN client received a shutdown request"))?;
         }
         if self.buffered_input_message.is_some() {
-            panic!("<TurnClient as Stream>::start_send called without prior poll_ready");
+            panic!("<TurnClient as Sink>::start_send called without prior poll_ready");
         }
         self.buffered_input_message = Some(msg);
 
@@ -969,94 +1143,101 @@ impl Sink<MessageToTurnServer> for TurnClient {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this : &mut TurnClient = Pin::into_inner(self);
-        'main: loop {  
-            // Parial sending logic for immediate sending (excluding the delay and timeout handling)
-           
+        let this: &mut TurnClient = Pin::into_inner(self);
+        'main: loop {
+            // Partial sending logic for immediate sending (excluding the delay and timeout handling)
+
             // XXX quadratical complexity on number of in-flight requests
             'requests: for (_, rq) in &mut this.inflight {
                 match &mut rq.status {
                     InflightRequestStatus::TimedOut => {
                         // handled in Stream::poll_next
-                    },
+                    }
                     InflightRequestStatus::SendNow => {
-                        match this.udp.poll_send_to(cx, &rq.data[..], this.opts.turn_server) {
-                            Poll::Ready(Err(e))=>Err(e)?,
+                        match this
+                            .udp
+                            .poll_send_to(cx, &rq.data[..], this.opts.turn_server)
+                        {
+                            Poll::Ready(Err(e)) => Err(e)?,
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Ok(len)) => {
                                 // TODO: deduplicate this fragment
                                 assert_eq!(len, rq.data.len());
-                                let d = tokio_timer::sleep_until(Instant::now() + this.opts.retry_interval);
+                                let d = tokio_timer::sleep_until(
+                                    Instant::now() + this.opts.retry_interval,
+                                );
                                 rq.status = InflightRequestStatus::RetryLater(Box::pin(d));
 
                                 continue 'requests;
-                            },
+                            }
                         }
-                    },
+                    }
                     InflightRequestStatus::RetryLater(ref mut _d) => {
                         // handled in Stream::poll_next
-                    },
+                    }
                 }
             }
 
             // secondly. process the incoming message
             let msg = match this.buffered_input_message.take() {
                 Some(x) => x,
-                None => return Poll::Ready(Ok(()))
+                None => return Poll::Ready(Ok(())),
             };
             use self::MessageToTurnServer::*;
             match msg {
                 Noop => (),
                 AddPermission(sa, chusage) => {
                     if this.permissions_pinger.is_none() {
-                        this.permissions_pinger = Some(tokio_timer::interval(Duration::from_secs(PERM_REFRESH_INTERVAL)));
+                        this.permissions_pinger = Some(tokio_timer::interval(Duration::from_secs(
+                            PERM_REFRESH_INTERVAL,
+                        )));
                     }
 
                     let channelized = chusage == ChannelUsage::WithChannel;
-    
+
                     if channelized {
                         if this.permissions.len() >= 0x3FFE {
-                            Err(anyhow!("There are too many permissions/channels to open another channel"))?
+                            Err(anyhow!(
+                                "There are too many permissions/channels to open another channel"
+                            ))?
                         }
                     }
-    
+
                     let p = Permission {
                         addr: sa,
                         channelized,
                         creation_already_reported: false,
                     };
                     let id = this.permissions.insert(p);
-                    this.sockaddr2perm.insert(sa, PermissionToken::from_handle(id, channelized));
+                    this.sockaddr2perm
+                        .insert(sa, PermissionToken::from_handle(id, channelized));
                     this.send_perm_request(id)?;
                     continue 'main;
-                },
-                SendTo(sa, ref data) => {
-                    match this.send_data_indication(cx, sa, &data[..]) {
-                        Poll::Ready(Ok(())) => (),
-                        Poll::Ready(Err(e)) => {
-                            this.buffered_input_message = Some(msg);
-                            return Poll::Ready(Err(e))
-                        },
-                        Poll::Pending => return Poll::Pending,
+                }
+                SendTo(sa, ref data) => match this.send_data_indication(cx, sa, &data[..]) {
+                    Poll::Ready(Ok(())) => (),
+                    Poll::Ready(Err(e)) => {
+                        this.buffered_input_message = Some(msg);
+                        return Poll::Ready(Err(e));
                     }
+                    Poll::Pending => return Poll::Pending,
                 },
                 Disconnect => {
                     this.send_allocate_request(true, false)?;
                     continue 'main;
-                },
+                }
                 ForceRefreshWithMobility => {
                     this.send_allocate_request(false, true)?;
                     continue 'main;
                 }
             }
-            return Poll::Ready(Ok(()))
+            return Poll::Ready(Ok(()));
         }
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.poll_flush(cx)
     }
-    
 }
 
 #[cfg(test)]
