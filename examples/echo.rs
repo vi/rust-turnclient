@@ -2,7 +2,7 @@ extern crate tokio;
 extern crate turnclient;
 
 
-use std::{net::{SocketAddr}, time::Duration};
+use std::{net::{SocketAddr}};
 
 use futures::{StreamExt};
 

@@ -1,6 +1,6 @@
 [package]
 name = "turnclient"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Vitaly _Vi Shukela <vi0oss@gmail.com>"]
 edition = "2018"
 description = "Simple TURN client for UDP - traverse even strict NAT; async only"
@@ -11,11 +11,11 @@ categories = ["network-programming"]
 readme = "README.md"
 
 [dependencies]
-stun_codec = "0.2"
+stun_codec = "0.3.0"
 bytecodec = "0.4.11"
 rand = "0.8"
 futures = { version = "0.3", optional = false }
-tokio = { version = "1", optional = false, features=["net","time"] }
+tokio = { version = "1", optional = false, features=["net","time","sync"] }
 trackable = "1"
 fnv = "1.0.6"
 slab_typesafe = "0.1.3"
